@@ -1,0 +1,9 @@
+{
+  "id": "lanying",
+  "channels": ["lanying"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
