@@ -1,154 +1,105 @@
-# OpenClaw Lanying Channel Plugin
+# OpenClaw Channel Plugin: Lanying
 
-`@openclaw/lanying` 是一个基于 WebSocket 的 OpenClaw 渠道插件，用于将 OpenClaw Agent 与蓝莺 IM 连接起来，实现入站消息接收、自动回复生成与出站消息发送。
+Lanying IM Channel for OpenClaw.
 
-## Overview
+## 功能说明
 
-本工程提供以下能力：
+- 使用蓝莺 IM Web SDK 接入 OpenClaw
+- 支持登录、收发文本消息
+- 支持断线后的自动重连
+- 当前版本仅处理单聊消息（群聊事件会忽略）
 
-- 蓝莺单账号接入（`channels.lanying`）
-- WebSocket 长连接管理（鉴权、心跳、断线重连）
-- 入站消息协议解析（兼容新协议与蓝莺 legacy 结构）
-- 入站 ACK 回执（`message.inbound.ack`）
-- 出站发送与 ACK 处理（`message.send` / `message.ack`）
-- 对接 OpenClaw 自动回复链路（route/session/dispatch）
+## 安装
 
-## Project Structure
+推荐使用 OpenClaw CLI 安装扩展。
 
-```text
-.
-├── index.ts            # 插件入口，注册 channel 并注入 runtime
-├── src/
-│   ├── channel.ts      # 渠道实现：配置、网关生命周期、收发/派发逻辑
-│   ├── ws-client.ts    # WebSocket 客户端：连接、心跳、重连、收发日志
-│   ├── types.ts        # 协议与客户端类型定义
-│   └── runtime.ts      # OpenClaw runtime 注入与访问
-├── openclaw.plugin.json
-├── tsconfig.json
-└── README.md
+从 npm 安装：
+
+```bash
+openclaw plugins install @lanyingim/lanying
 ```
 
-## Configuration
+从 GitHub 安装：
 
-当前为单账号模式：
-
-```yaml
-channels:
-  lanying:
-    enabled: true
-    name: lanying
-    token: "<YOUR_LANYING_TOKEN>"
+```bash
+git clone https://github.com/maxim-top/openclaw-channel-lanying
+openclaw plugins install ./openclaw-channel-lanying
 ```
 
-字段说明：
+## 配置
 
-- `channels.lanying.enabled`：是否启用渠道
-- `channels.lanying.token`：蓝莺 WebSocket 鉴权 token
-- `channels.lanying.name`：可选，账号显示名
-
-## WebSocket Message Protocol
-
-### Envelope
+在 OpenClaw 配置中添加 `channels.lanying`：
 
 ```json
 {
-  "v": 1,
-  "event": "message.inbound",
-  "ts": 1772010839642,
-  "requestId": "req_xxx",
-  "data": {}
-}
-```
-
-- `v`：协议版本
-- `event`：事件类型
-- `ts`：时间戳（毫秒）
-- `requestId`：请求追踪 ID
-- `data`：业务数据
-
-### Inbound (Server -> Plugin)
-
-```json
-{
-  "v": 1,
-  "event": "message.inbound",
-  "ts": 1772010839642,
-  "requestId": "req_in_xxx",
-  "data": {
-    "from": "6597200000001",
-    "to": "65973000000002",
-    "chatType": "direct",
-    "msgId": "711785029071536147",
-    "contentType": "text",
-    "content": "hello!"
+  "channels": {
+    "lanying": {
+      "enabled": true,
+      "app_id": "xxxxx",
+      "username": "xxxx",
+      "password": "xxxx",
+      "dmPolicy": "open",
+      "allowFrom": ["*"]
+    }
   }
 }
 ```
 
-### Inbound ACK (Plugin -> Server)
+### 参数说明
 
-```json
-{
-  "v": 1,
-  "event": "message.inbound.ack",
-  "ts": 1772010839647,
-  "requestId": "req_in_xxx",
-  "data": {
-    "msgId": "711785029071536147",
-    "ok": true
-  }
-}
-```
+- `enabled`: 是否启用插件（默认 `true`）
+- `app_id`: 蓝莺应用 App ID
+- `username`: 登录名
+- `password`: 登录密码
+- `dmPolicy`: 私聊策略，常用 `open` 或 `pairing`
+- `allowFrom`: 允许发起对话的来源列表
+- `defaultTo`: 可选，默认发送目标
 
-### Outbound (Plugin -> Server)
+## 使用
 
-```json
-{
-  "v": 1,
-  "event": "message.send",
-  "ts": 1772011651216,
-  "requestId": "reply_xxx",
-  "data": {
-    "to": "6597200000001",
-    "chatType": "direct",
-    "contentType": "text",
-    "content": "Hello from OpenClaw"
-  }
-}
-```
+配置生效并重启网关后：
 
-### Outbound ACK (Server -> Plugin)
+1. 用蓝莺账号向机器人账号发送私聊消息
+2. 插件收到消息后会转发给 OpenClaw
+3. OpenClaw 生成回复后由插件回发到蓝莺
 
-```json
-{
-  "v": 1,
-  "event": "message.ack",
-  "ts": 1772011651222,
-  "requestId": "reply_xxx",
-  "data": {
-    "msgId": "6",
-    "ok": true
-  }
-}
-```
+## 日志与排查
 
-`message.ack` 会被当作回执事件处理，不会再误走 inbound 解析。
+插件日志前缀为 `[lanying]`，常见关键日志：
 
-## Runtime Flow
+- `attempting login`
+- `login success`
+- `sdk ready`
+- `inbound event: onRosterMessage`
+- `inbound message`
+- `reply dispatcher result`
+- `schedule reconnect`
+- `reconnect attempt start`
+- `reconnect attempt success`
 
-1. 插件启动后建立蓝莺 WebSocket 长连接
-2. 收到 `message.inbound` 后立即回 `message.inbound.ack`
-3. 将消息派发到 OpenClaw 回复链路：
-   - `resolveAgentRoute`
-   - `finalizeInboundContext`
-   - `recordInboundSession`
-   - `dispatchReplyWithBufferedBlockDispatcher`
-4. 生成回复后发送 `message.send`
-5. 接收服务端 `message.ack` 更新状态与日志
+### 常见问题
 
-## Logging
+1. 登录成功但很快退出
 
-默认包含协议收发调试日志：
+- 请确认 `app_id/username/password` 正确
+- 观察是否出现 `loginFail event` 或 `flooError event`
 
-- `[lanying] rx: ...`：收到原始 JSON
-- `[lanying] tx: ...`：发送 JSON
+2. 收到消息但 OpenClaw 不回复
+
+- 当前只处理单聊；群聊不会触发回复
+- 历史消息、回环消息（`from === to`）和自发同步消息会被跳过
+- 检查是否出现 `reply dispatcher skipped payload` 或 `reply dispatcher send failed`
+
+3. 断线后未恢复
+
+- 检查是否有 `disconnected` / `schedule reconnect` / `reconnect attempt` 日志
+- 插件已内置指数退避重连（2s 起步，最大 30s）
+
+## 目标格式（主动发送时）
+
+插件支持以下目标写法：
+
+- `user:<uid>`
+- `group:<gid>`
+- 直接写 `<uid>`（按单聊处理）
+- 可带前缀 `lanying:`，例如 `lanying:user:123456`
