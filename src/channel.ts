@@ -47,12 +47,14 @@ type LanyingImClient = {
       type: string;
       uid: string;
       content: string;
+      ext?: string;
       attachment?: unknown;
     }) => Promise<unknown>;
     sendGroupMessage: (params: {
       type: string;
       gid: string;
       content: string;
+      ext?: string;
       attachment?: unknown;
     }) => Promise<unknown>;
   };
@@ -437,6 +439,8 @@ class LanyingSession {
   private shuttingDown = false;
   private selfId = "";
   private lastConfig?: ResolvedLanyingAccount;
+  private onlineMarkerSent = false;
+  private offlineMarkerSent = false;
 
   private currentConfigKey(account: ResolvedLanyingAccount): string {
     return `${account.appId}::${account.username}::${account.password}`;
@@ -784,6 +788,8 @@ class LanyingSession {
       await this.shutdown();
       this.shuttingDown = false;
       this.client = await this.createClient(account);
+      this.onlineMarkerSent = false;
+      this.offlineMarkerSent = false;
       this.accountKey = nextKey;
       this.lastConfig = account;
       this.bindListeners(account);
@@ -822,6 +828,7 @@ class LanyingSession {
         const loggedIn = Boolean(this.client?.isLogin?.());
         if (loggedIn) {
           this.updateSelfIdFromClient("login fully ready");
+          await this.sendLoginMarkerToSelf();
           logDebug("sdk ready", { ready, loggedIn });
           this.resetReconnectState("login_success");
           return;
@@ -850,7 +857,59 @@ class LanyingSession {
     }
     if (uid !== this.selfId) {
       this.selfId = uid;
-      logDebug("updated selfId from store getUid", { reason, selfId: this.selfId });
+      logDebug("updated selfId from client userManage.getUid", { reason, selfId: this.selfId });
+    }
+  }
+
+  private async sendLoginMarkerToSelf(): Promise<void> {
+    if (!this.client || !this.selfId || this.onlineMarkerSent) {
+      return;
+    }
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        if (!this.client?.isLogin?.()) {
+          return;
+        }
+        await this.client.sysManage.sendRosterMessage({
+          type: "text",
+          uid: this.selfId,
+          content: "蓝莺插件已上线",
+          ext: JSON.stringify({ openclaw: { type: "online" } }),
+        });
+        this.onlineMarkerSent = true;
+        this.offlineMarkerSent = false;
+        logDebug("sent login marker message to self", { selfId: this.selfId, attempt });
+        return;
+      } catch (err) {
+        if (attempt >= maxAttempts) {
+          logWarn("failed to send login marker message to self", {
+            err,
+            selfId: this.selfId,
+            attempt,
+          });
+          return;
+        }
+        await sleep(250 * attempt);
+      }
+    }
+  }
+
+  private async sendOfflineMarkerToSelf(): Promise<void> {
+    if (!this.client || !this.selfId || this.offlineMarkerSent) {
+      return;
+    }
+    try {
+      await this.client.sysManage.sendRosterMessage({
+        type: "text",
+        uid: this.selfId,
+        content: "蓝莺插件已下线",
+        ext: JSON.stringify({ openclaw: { type: "offline" } }),
+      });
+      this.offlineMarkerSent = true;
+      logDebug("sent offline marker message to self", { selfId: this.selfId });
+    } catch (err) {
+      logWarn("failed to send offline marker message to self", { err, selfId: this.selfId });
     }
   }
 
@@ -892,6 +951,9 @@ class LanyingSession {
   }
 
   async shutdown(): Promise<void> {
+    if (this.shuttingDown) {
+      return;
+    }
     this.shuttingDown = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -903,6 +965,7 @@ class LanyingSession {
       return;
     }
     logDebug("shutting down lanying session");
+    await this.sendOfflineMarkerToSelf();
     try {
       this.client.disConnect?.();
     } catch (err) {
@@ -918,6 +981,7 @@ class LanyingSession {
     this.listenersBound = false;
     this.loginPromise = null;
     this.selfId = "";
+    this.onlineMarkerSent = false;
   }
 }
 
