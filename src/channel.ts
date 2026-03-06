@@ -56,6 +56,9 @@ type LanyingImClient = {
       attachment?: unknown;
     }) => Promise<unknown>;
   };
+  rosterManage?: {
+    readRosterMessage: (rosterId: number, mid?: number | string) => unknown;
+  };
 };
 
 const meta = {
@@ -277,6 +280,30 @@ function pickId(value: unknown): string {
     }
   }
   return "";
+}
+
+function pickNumberId(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.trunc(value);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    const parsed = Number(trimmed);
+    if (Number.isFinite(parsed)) {
+      return Math.trunc(parsed);
+    }
+  }
+  if (value && typeof value === "object") {
+    const nested = pickNumberId((value as { id?: unknown }).id);
+    if (nested !== null) {
+      return nested;
+    }
+    return pickNumberId((value as { uid?: unknown }).uid);
+  }
+  return null;
 }
 
 function extractText(event: LanyingInboundEvent): string {
@@ -663,6 +690,40 @@ class LanyingSession {
         pickId(eventAny.id ?? meta.id) ||
         pickId((eventAny as { message_id?: unknown }).message_id) ||
         "";
+      const inboundMid =
+        pickId(eventAny.id ?? meta.id) ||
+        pickId((eventAny as { message_id?: unknown }).message_id) ||
+        pickId((eventAny as { mid?: unknown }).mid) ||
+        pickId((eventAny as { message?: unknown }).message);
+      const senderUid = pickNumberId(senderId);
+      if (
+        mode === "direct" &&
+        senderId &&
+        toId &&
+        senderId !== toId &&
+        senderId !== this.selfId &&
+        senderUid !== null &&
+        inboundMid
+      ) {
+        try {
+          const readResult = this.client?.rosterManage?.readRosterMessage(senderUid, inboundMid);
+          await Promise.resolve(readResult);
+          logDebug("marked inbound direct message as read", {
+            senderUid,
+            mid: inboundMid,
+            senderId,
+            toId,
+          });
+        } catch (err) {
+          logWarn("failed to mark inbound direct message as read", {
+            err,
+            senderUid,
+            mid: inboundMid ?? undefined,
+            senderId,
+            toId,
+          });
+        }
+      }
       const timestampNum = Number(
         eventAny.timestamp ?? meta.timestamp ?? (eventAny as { ts?: unknown }).ts ?? Date.now(),
       );
