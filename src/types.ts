@@ -6,6 +6,7 @@ export type LanyingChannelConfig = {
   app_id?: string;
   username?: string;
   password?: string;
+  allowManage?: boolean;
   dmPolicy?: string;
   allowFrom?: Array<string | number>;
   defaultTo?: string;
@@ -18,6 +19,7 @@ export type ResolvedLanyingAccount = {
   appId: string;
   username: string;
   password: string;
+  allowManage: boolean;
   dmPolicy: string;
   allowFrom: string[];
   defaultTo?: string;

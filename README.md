@@ -13,7 +13,7 @@ Lanying IM Channel for OpenClaw.
 
 推荐使用 OpenClaw CLI 安装扩展。
 
-从 npm 安装：
+从 npm 安装（推荐）：
 
 ```bash
 openclaw plugins install @lanyingim/lanying
@@ -38,6 +38,7 @@ openclaw plugins install ./openclaw-channel-lanying
       "app_id": "xxxxx",
       "username": "xxxx",
       "password": "xxxx",
+      "allowManage": false,
       "dmPolicy": "open",
       "allowFrom": ["*"]
     }
@@ -51,9 +52,27 @@ openclaw plugins install ./openclaw-channel-lanying
 - `app_id`: 蓝莺应用 App ID
 - `username`: 登录名
 - `password`: 登录密码
+- `allowManage`: 是否允许通过自发消息触发配置变更（默认 `false`）
 - `dmPolicy`: 私聊策略，常用 `open` 或 `pairing`
 - `allowFrom`: 允许发起对话的来源列表
-- `defaultTo`: 可选，默认发送目标
+
+当 `allowManage=true` 时，若收到 `from` 和 `to` 都等于当前 `selfId` 的消息，且 `ext` 为：
+
+```json
+{
+  "openclaw": {
+    "type": "config_patch",
+    "raw": "PATCH STRING"
+  }
+}
+```
+
+插件会执行：
+
+```bash
+openclaw gateway call config.get --params '{}'
+openclaw gateway call config.patch --params '{"raw":"PATCH STRING","baseHash":"xxxxxxx"}'
+```
 
 ## 使用
 

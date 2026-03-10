@@ -4,6 +4,8 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { execFile as execFileCb } from "node:child_process";
+import { promisify } from "node:util";
 import {
   formatPairingApproveHint,
   type ChannelPlugin,
@@ -83,6 +85,7 @@ const sdkModulePath = path.resolve(
   "./lanying-im-sdk/floo-3.0.0.js",
 );
 let cachedFlooFactory: FlooFactory | null = null;
+const execFile = promisify(execFileCb);
 const READY_TIMEOUT_MS = 15_000;
 const READY_POLL_MS = 250;
 const RECONNECT_BASE_DELAY_MS = 2_000;
@@ -311,6 +314,251 @@ function pickNumberId(value: unknown): number | null {
   return null;
 }
 
+function maybeParseJson(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed || (!trimmed.startsWith("{") && !trimmed.startsWith("["))) {
+    return null;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function stripAnsi(text: string): string {
+  return text.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function parseJsonFromMixedText(text: string): unknown {
+  const cleaned = stripAnsi(text).trim();
+  if (!cleaned) {
+    return null;
+  }
+
+  const direct = maybeParseJson(cleaned);
+  if (direct !== null) {
+    return direct;
+  }
+
+  const fencedMatches = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/gi) ?? [];
+  for (const block of fencedMatches) {
+    const body = block.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+    const parsed = maybeParseJson(body);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  const firstObj = cleaned.indexOf("{");
+  const lastObj = cleaned.lastIndexOf("}");
+  if (firstObj >= 0 && lastObj > firstObj) {
+    const parsed = maybeParseJson(cleaned.slice(firstObj, lastObj + 1));
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  const firstArr = cleaned.indexOf("[");
+  const lastArr = cleaned.lastIndexOf("]");
+  if (firstArr >= 0 && lastArr > firstArr) {
+    const parsed = maybeParseJson(cleaned.slice(firstArr, lastArr + 1));
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  for (const line of cleaned.split(/\r?\n/)) {
+    const t = line.trim();
+    const parsed = maybeParseJson(t);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+function parseExtValue(value: unknown): Record<string, unknown> | null {
+  if (!value) {
+    return null;
+  }
+  if (typeof value === "string") {
+    const parsed = maybeParseJson(value);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return null;
+  }
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function extractConfigPatchRaw(
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+): string | null {
+  const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
+  const extObjCandidates = [
+    parseExtValue(eventAny.ext),
+    parseExtValue(meta.ext),
+    parseExtValue(payload?.ext),
+  ].filter(Boolean) as Record<string, unknown>[];
+
+  for (const extObj of extObjCandidates) {
+    const openclaw = extObj.openclaw;
+    if (!openclaw || typeof openclaw !== "object" || Array.isArray(openclaw)) {
+      continue;
+    }
+    const openclawObj = openclaw as Record<string, unknown>;
+    if (openclawObj.type !== "config_patch") {
+      continue;
+    }
+    const raw = openclawObj.raw ?? openclawObj.patch ?? openclawObj.config_patch;
+    if (typeof raw === "string" && raw.trim()) {
+      return raw;
+    }
+  }
+  return null;
+}
+
+async function runGatewayCall(command: string, params: Record<string, unknown>): Promise<unknown> {
+  const args = ["gateway", "call", command, "--params", JSON.stringify(params)];
+  logDebug("exec openclaw gateway call", {
+    command,
+    paramsKeys: Object.keys(params),
+  });
+  const { stdout, stderr } = await execFile("openclaw", args, {
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  if (stderr.trim()) {
+    logWarn(`openclaw ${command} stderr`, stderr.trim());
+  }
+  const parsed = parseJsonFromMixedText(stdout);
+  const stdoutTrimmed = stdout.trim();
+  const stdoutNoAnsi = stripAnsi(stdout);
+  logDebug("openclaw gateway call completed", {
+    command,
+    stdoutBytes: Buffer.byteLength(stdout, "utf8"),
+    stdoutSha1: createHash("sha1").update(stdout).digest("hex").slice(0, 12),
+    parsedAsJson: parsed !== null,
+    parsedType:
+      parsed === null ? "null" : Array.isArray(parsed) ? "array" : typeof parsed,
+    parsedKeys:
+      parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? Object.keys(parsed as Record<string, unknown>).slice(0, 20)
+        : [],
+    containsBaseHashToken: /base[_-]?hash/i.test(stdoutNoAnsi),
+  });
+  return parsed ?? stdoutTrimmed;
+}
+
+function findBaseHash(value: unknown): string {
+  if (!value) {
+    return "";
+  }
+  if (typeof value === "string") {
+    const parsed = parseJsonFromMixedText(value);
+    if (parsed !== null) {
+      return findBaseHash(parsed);
+    }
+    const text = stripAnsi(value);
+    const regexes = [
+      /"baseHash"\s*:\s*"([^"]+)"/i,
+      /"base_hash"\s*:\s*"([^"]+)"/i,
+      /\bbaseHash\b\s*[:=]\s*["']?([A-Za-z0-9._:-]+)["']?/i,
+      /\bbase_hash\b\s*[:=]\s*["']?([A-Za-z0-9._:-]+)["']?/i,
+    ];
+    for (const re of regexes) {
+      const matched = text.match(re);
+      const candidate = matched?.[1]?.trim();
+      if (candidate) {
+        return candidate;
+      }
+    }
+    return "";
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const nested = findBaseHash(item);
+      if (nested) {
+        return nested;
+      }
+    }
+    return "";
+  }
+  if (typeof value !== "object") {
+    return "";
+  }
+
+  const obj = value as Record<string, unknown>;
+  const directCandidates = [
+    obj.baseHash,
+    obj.base_hash,
+    obj.hash,
+    obj.configHash,
+    obj.config_hash,
+  ];
+  for (const candidate of directCandidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+  for (const nested of Object.values(obj)) {
+    const found = findBaseHash(nested);
+    if (found) {
+      return found;
+    }
+  }
+  return "";
+}
+
+function isHistoryEvent(eventAny: Record<string, unknown>, meta: Record<string, unknown>): boolean {
+  const isHistoryRaw = (eventAny.isHistory ?? meta.isHistory) as unknown;
+  return (
+    isHistoryRaw === true ||
+    isHistoryRaw === "true" ||
+    isHistoryRaw === 1 ||
+    isHistoryRaw === "1"
+  );
+}
+
+function collectHashCandidates(
+  value: unknown,
+  path = "$",
+  out: Array<{ path: string; value: string }> = [],
+): Array<{ path: string; value: string }> {
+  if (out.length >= 20 || value == null) {
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length && out.length < 20; i += 1) {
+      collectHashCandidates(value[i], `${path}[${i}]`, out);
+    }
+    return out;
+  }
+  if (typeof value !== "object") {
+    return out;
+  }
+
+  const obj = value as Record<string, unknown>;
+  for (const [key, nested] of Object.entries(obj)) {
+    if (out.length >= 20) {
+      break;
+    }
+    const keyLower = key.toLowerCase();
+    if (keyLower.includes("hash") && typeof nested === "string" && nested.trim()) {
+      out.push({
+        path: `${path}.${key}`,
+        value: nested.trim().slice(0, 24),
+      });
+    }
+    collectHashCandidates(nested, `${path}.${key}`, out);
+  }
+  return out;
+}
+
 function extractText(event: LanyingInboundEvent): string {
   const eventAny = event as Record<string, unknown>;
   const meta = (eventAny.meta ?? eventAny) as Record<string, unknown>;
@@ -422,6 +670,7 @@ function resolveLanyingAccount(cfg: OpenClawConfig): ResolvedLanyingAccount {
     appId,
     username,
     password,
+    allowManage: channelCfg.allowManage === true,
     dmPolicy: channelCfg.dmPolicy ?? "pairing",
     allowFrom: (channelCfg.allowFrom ?? []).map((entry) => String(entry).trim()).filter(Boolean),
     defaultTo: channelCfg.defaultTo?.trim() || undefined,
@@ -441,6 +690,48 @@ class LanyingSession {
   private lastConfig?: ResolvedLanyingAccount;
   private onlineMarkerSent = false;
   private offlineMarkerSent = false;
+
+  private async applyOpenClawConfigPatch(rawPatch: string): Promise<void> {
+    logDebug("apply config patch requested", {
+      patchBytes: Buffer.byteLength(rawPatch, "utf8"),
+    });
+    const getResult = await runGatewayCall("config.get", {});
+    logDebug("config.get result summary", {
+      resultType: Array.isArray(getResult) ? "array" : typeof getResult,
+      rootKeys:
+        getResult && typeof getResult === "object" && !Array.isArray(getResult)
+          ? Object.keys(getResult as Record<string, unknown>).slice(0, 20)
+          : [],
+      hashCandidates: collectHashCandidates(getResult),
+    });
+    const baseHash = findBaseHash(getResult);
+    if (!baseHash) {
+      if (typeof getResult === "string") {
+        const cleaned = stripAnsi(getResult);
+        const hashLines = cleaned
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => /hash/i.test(line))
+          .slice(0, 8)
+          .map((line) => line.slice(0, 220));
+        logWarn("config.get string output debug", {
+          textBytes: Buffer.byteLength(getResult, "utf8"),
+          hasHashToken: /hash/i.test(cleaned),
+          hashLines,
+        });
+      }
+      throw new Error("Failed to read baseHash from config.get output.");
+    }
+    logDebug("resolved baseHash for config.patch", {
+      baseHashPreview: baseHash.slice(0, 12),
+      baseHashLength: baseHash.length,
+    });
+    await runGatewayCall("config.patch", {
+      raw: rawPatch,
+      baseHash,
+    });
+    logDebug("config.patch call finished");
+  }
 
   private currentConfigKey(account: ResolvedLanyingAccount): string {
     return `${account.appId}::${account.username}::${account.password}`;
@@ -465,7 +756,11 @@ class LanyingSession {
     this.listenersBound = true;
     logDebug("binding inbound listeners");
     const onDirect = (name: string, event: unknown) => {
-      logDebug(`inbound event: ${name}`, event);
+      const eventAny = (event ?? {}) as Record<string, unknown>;
+      const meta = (eventAny.meta ?? eventAny) as Record<string, unknown>;
+      if (!isHistoryEvent(eventAny, meta)) {
+        logDebug(`inbound event: ${name}`, event);
+      }
       void this.onInbound(event as LanyingInboundEvent, "direct", account);
     };
     const onGroup = (name: string, event: unknown) => {
@@ -620,9 +915,7 @@ class LanyingSession {
       }
       const eventAny = event as Record<string, unknown>;
       const meta = (eventAny.meta ?? eventAny) as Record<string, unknown>;
-      const isHistoryRaw = (eventAny.isHistory ?? meta.isHistory) as unknown;
-      const isHistory =
-        isHistoryRaw === true || isHistoryRaw === "true" || isHistoryRaw === 1 || isHistoryRaw === "1";
+      const isHistory = isHistoryEvent(eventAny, meta);
       if (isHistory) {
         logDebug("skip history inbound event", {
           mode,
@@ -636,12 +929,6 @@ class LanyingSession {
         pickId((event as { sender?: unknown }).sender) ||
         pickId((event as { uid?: unknown }).uid) ||
         pickId(meta.from);
-
-      const body = extractText(event);
-      if (!body) {
-        logDebug("skip empty inbound", { mode, eventType: event.type });
-        return;
-      }
 
       const toId =
         pickId(event.to) ||
@@ -660,9 +947,43 @@ class LanyingSession {
         return;
       }
       this.updateSelfIdFromClient("inbound event");
-
+      const configPatchRaw = extractConfigPatchRaw(eventAny, meta);
       if (senderId && toId && senderId === toId) {
-        logDebug("skip loopback message (from === to)", { senderId, toId, targetId });
+        const isSelfLoopback = Boolean(this.selfId && senderId === this.selfId);
+        if (isSelfLoopback && account.allowManage && configPatchRaw) {
+          try {
+            await this.applyOpenClawConfigPatch(configPatchRaw);
+            logDebug("applied config patch from self loopback message", {
+              senderId,
+              toId,
+              patchBytes: Buffer.byteLength(configPatchRaw, "utf8"),
+            });
+          } catch (err) {
+            logError("failed to apply config patch from self loopback message", {
+              err,
+              senderId,
+              toId,
+              selfId: this.selfId,
+              allowManage: account.allowManage,
+              hasConfigPatch: Boolean(configPatchRaw),
+              patchBytes: Buffer.byteLength(configPatchRaw, "utf8"),
+            });
+          }
+          return;
+        }
+        logDebug("skip loopback message (from === to)", {
+          senderId,
+          toId,
+          selfId: this.selfId,
+          allowManage: account.allowManage,
+          hasConfigPatch: Boolean(configPatchRaw),
+        });
+        return;
+      }
+
+      const body = extractText(event);
+      if (!body) {
+        logDebug("skip empty inbound", { mode, eventType: event.type });
         return;
       }
 
@@ -1007,6 +1328,7 @@ export const lanyingPlugin: ChannelPlugin<ResolvedLanyingAccount> = {
       accountId: account.accountId,
       enabled: account.enabled,
       configured: account.configured,
+      allowManage: account.allowManage,
       dmPolicy: account.dmPolicy,
     }),
     resolveAllowFrom: ({ cfg }) => resolveLanyingAccount(cfg).allowFrom,
