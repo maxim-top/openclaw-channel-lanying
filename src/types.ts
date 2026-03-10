@@ -3,6 +3,7 @@ export const LANYING_DEFAULT_ACCOUNT_ID = "default";
 
 export type LanyingChannelConfig = {
   enabled?: boolean;
+  appId?: string;
   app_id?: string;
   username?: string;
   password?: string;

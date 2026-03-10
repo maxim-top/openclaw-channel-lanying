@@ -35,7 +35,7 @@ openclaw plugins install ./openclaw-channel-lanying
   "channels": {
     "lanying": {
       "enabled": true,
-      "app_id": "xxxxx",
+      "appId": "xxxxx",
       "username": "xxxx",
       "password": "xxxx",
       "allowManage": false,
@@ -49,7 +49,7 @@ openclaw plugins install ./openclaw-channel-lanying
 ### 参数说明
 
 - `enabled`: 是否启用插件（默认 `true`）
-- `app_id`: 蓝莺应用 App ID
+- `appId`: 蓝莺应用 App ID
 - `username`: 登录名
 - `password`: 登录密码
 - `allowManage`: 是否允许通过自发消息触发配置变更（默认 `false`）
@@ -100,7 +100,7 @@ openclaw gateway call config.patch --params '{"raw":"PATCH STRING","baseHash":"x
 
 1. 登录成功但很快退出
 
-- 请确认 `app_id/username/password` 正确
+- 请确认 `appId/username/password` 正确
 - 观察是否出现 `loginFail event` 或 `flooError event`
 
 2. 收到消息但 OpenClaw 不回复

@@ -654,7 +654,7 @@ function resolveLanyingConfig(cfg: OpenClawConfig): LanyingChannelConfig {
 
 function resolveLanyingAccount(cfg: OpenClawConfig): ResolvedLanyingAccount {
   const channelCfg = resolveLanyingConfig(cfg);
-  const appIdRaw = channelCfg.app_id ?? "";
+  const appIdRaw = channelCfg.appId ?? channelCfg.app_id ?? "";
   const usernameRaw = channelCfg.username ?? "";
   const passwordRaw = channelCfg.password ?? "";
 
@@ -1099,7 +1099,7 @@ class LanyingSession {
 
   async ensureReady(account: ResolvedLanyingAccount): Promise<void> {
     if (!account.configured) {
-      throw new Error("Lanying account is not configured (enabled/app_id/username/password).");
+      throw new Error("Lanying account is not configured (enabled/appId/username/password).");
     }
 
     const nextKey = this.currentConfigKey(account);
@@ -1363,7 +1363,7 @@ export const lanyingPlugin: ChannelPlugin<ResolvedLanyingAccount> = {
     collectWarnings: ({ account }) => {
       if (account.enabled && !account.configured) {
         return [
-          '- Lanying is enabled but not configured. Set channels.lanying.app_id, channels.lanying.username, channels.lanying.password.',
+          '- Lanying is enabled but not configured. Set channels.lanying.appId, channels.lanying.username, channels.lanying.password.',
         ];
       }
       return [];
@@ -1421,7 +1421,7 @@ export const lanyingPlugin: ChannelPlugin<ResolvedLanyingAccount> = {
         return { stop: () => {} };
       }
       if (!account.configured) {
-        const reason = "Lanying is not configured (app_id/username/password)";
+        const reason = "Lanying is not configured (appId/username/password)";
         ctx.log?.warn?.(`[lanying] ${reason}`);
         throw new Error(reason);
       }
