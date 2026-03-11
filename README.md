@@ -54,7 +54,7 @@ openclaw plugins install ./openclaw-channel-lanying
 - `password`: 登录密码
 - `allowManage`: 是否允许通过自发消息触发配置变更（默认 `false`）
 - `dmPolicy`: 私聊策略，常用 `open` 或 `pairing`
-- `allowFrom`: 允许发起对话的来源列表
+- `allowFrom`: 允许发起对话的来源列表。`dmPolicy=open` 且未设置时会自动补为 `["*"]`。
 
 当 `allowManage=true` 时，若收到 `from` 和 `to` 都等于当前 `selfId` 的消息，且 `ext` 为：
 

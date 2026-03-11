@@ -762,6 +762,11 @@ function resolveLanyingAccount(cfg: OpenClawConfig): ResolvedLanyingAccount {
         ? channelCfg.enable
         : false;
   const enabled = enabledFlag === true;
+  const dmPolicy = channelCfg.dmPolicy ?? "pairing";
+  const parsedAllowFrom = (channelCfg.allowFrom ?? [])
+    .map((entry) => String(entry).trim())
+    .filter(Boolean);
+  const allowFrom = dmPolicy === "open" && parsedAllowFrom.length === 0 ? ["*"] : parsedAllowFrom;
 
   return {
     accountId: LANYING_DEFAULT_ACCOUNT_ID,
@@ -771,8 +776,8 @@ function resolveLanyingAccount(cfg: OpenClawConfig): ResolvedLanyingAccount {
     username,
     password,
     allowManage: channelCfg.allowManage === true,
-    dmPolicy: channelCfg.dmPolicy ?? "pairing",
-    allowFrom: (channelCfg.allowFrom ?? []).map((entry) => String(entry).trim()).filter(Boolean),
+    dmPolicy,
+    allowFrom,
     defaultTo: channelCfg.defaultTo?.trim() || undefined,
   };
 }
