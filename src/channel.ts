@@ -755,7 +755,13 @@ function resolveLanyingAccount(cfg: OpenClawConfig): ResolvedLanyingAccount {
   const username = String(usernameRaw).trim();
   const password = String(passwordRaw).trim();
   const hasCredentials = Boolean(appId && username && password);
-  const enabled = channelCfg.enabled === true;
+  const enabledFlag =
+    typeof channelCfg.enabled === "boolean"
+      ? channelCfg.enabled
+      : typeof channelCfg.enable === "boolean"
+        ? channelCfg.enable
+        : false;
+  const enabled = enabledFlag === true;
 
   return {
     accountId: LANYING_DEFAULT_ACCOUNT_ID,
