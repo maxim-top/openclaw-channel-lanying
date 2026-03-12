@@ -38,6 +38,7 @@ type LanyingImClient = {
   ) => unknown;
   disConnect?: () => unknown;
   logout?: () => unknown;
+  cleanup?: () => unknown;
   isReady?: () => boolean;
   isLogin?: () => boolean;
   listen: (
@@ -791,12 +792,43 @@ class LanyingSession {
   private reconnectPromise: Promise<void> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
+  private reconnectForceRecreate = false;
   private listenersBound = false;
   private shuttingDown = false;
   private selfId = "";
   private lastConfig?: ResolvedLanyingAccount;
   private onlineMarkerSent = false;
   private offlineMarkerSent = false;
+  private runtimeStatusUpdater:
+    | ((next: Record<string, unknown> & { accountId?: string }) => void)
+    | null = null;
+  private runtimeAccountId: string | null = null;
+
+  bindRuntimeStatus(params: {
+    accountId: string;
+    update: (next: Record<string, unknown> & { accountId?: string }) => void;
+  }): void {
+    this.runtimeAccountId = params.accountId;
+    this.runtimeStatusUpdater = params.update;
+  }
+
+  clearRuntimeStatus(accountId?: string): void {
+    if (accountId && this.runtimeAccountId && this.runtimeAccountId !== accountId) {
+      return;
+    }
+    this.runtimeAccountId = null;
+    this.runtimeStatusUpdater = null;
+  }
+
+  private updateRuntimeStatus(next: Record<string, unknown>): void {
+    if (!this.runtimeStatusUpdater) {
+      return;
+    }
+    this.runtimeStatusUpdater({
+      accountId: this.runtimeAccountId ?? undefined,
+      ...next,
+    });
+  }
 
   private async applyOpenClawConfigPatch(rawPatch: string): Promise<void> {
     logDebug("apply config patch requested", {
@@ -900,7 +932,12 @@ class LanyingSession {
       loginSuccess: (event: unknown) => logDebug("loginSuccess event", event),
       loginFail: (event: unknown) => {
         logWarn("loginFail event", event);
-        this.scheduleReconnect("loginFail");
+        this.updateRuntimeStatus({
+          running: true,
+          connected: false,
+          lastError: "loginFail",
+          lastDisconnect: { at: Date.now(), error: "loginFail" },
+        });
       },
       messageNormal: (event: unknown) => logDebug("messageNormal event", event),
       flooNotice: (event: unknown) => {
@@ -908,18 +945,49 @@ class LanyingSession {
       },
       flooError: (event: unknown) => {
         logWarn("flooError event", event);
-        this.scheduleReconnect("flooError");
+        this.updateRuntimeStatus({
+          running: true,
+          connected: false,
+          lastError: "flooError",
+          lastDisconnect: { at: Date.now(), error: "flooError" },
+        });
+      },
+      fireplaceError: (event: unknown) => {
+        logWarn("fireplaceError event", event);
+        this.updateRuntimeStatus({
+          running: true,
+          connected: false,
+          lastError: "fireplaceError",
+          lastDisconnect: { at: Date.now(), error: "fireplaceError" },
+        });
+        this.scheduleReconnect("fireplaceError", { forceRecreate: true });
       },
       reconnect: (event: unknown) => {
         logWarn("reconnect event", event);
-        this.scheduleReconnect("reconnect");
+        this.updateRuntimeStatus({
+          running: true,
+          connected: false,
+          lastError: "reconnect",
+          lastDisconnect: { at: Date.now(), error: "reconnect" },
+        });
       },
       disconnected: (event: unknown) => {
         logWarn("disconnected", event);
-        this.scheduleReconnect("disconnected");
+        this.updateRuntimeStatus({
+          running: true,
+          connected: false,
+          lastDisconnect: { at: Date.now(), error: "disconnected" },
+        });
       },
       connected: (event: unknown) => {
         logDebug("connected", event);
+        this.updateRuntimeStatus({
+          running: true,
+          connected: true,
+          reconnectAttempts: 0,
+          lastConnectedAt: Date.now(),
+          lastError: null,
+        });
         this.resetReconnectState("connected");
       },
       auth: (event: unknown) => {
@@ -937,11 +1005,12 @@ class LanyingSession {
       this.reconnectTimer = null;
     }
     this.reconnectAttempts = 0;
+    this.reconnectForceRecreate = false;
     this.reconnectPromise = null;
     logDebug("reconnect state reset", { reason });
   }
 
-  private scheduleReconnect(trigger: string): void {
+  private scheduleReconnect(trigger: string, options?: { forceRecreate?: boolean }): void {
     if (this.shuttingDown) {
       logDebug("skip reconnect: session is shutting down", { trigger });
       return;
@@ -968,6 +1037,8 @@ class LanyingSession {
       return;
     }
 
+    this.reconnectForceRecreate = this.reconnectForceRecreate || Boolean(options?.forceRecreate);
+
     const exp = Math.min(this.reconnectAttempts, 6);
     const delay = Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * 2 ** exp);
     this.reconnectAttempts += 1;
@@ -975,6 +1046,12 @@ class LanyingSession {
       trigger,
       attempt: this.reconnectAttempts,
       delayMs: delay,
+    });
+    this.updateRuntimeStatus({
+      running: true,
+      connected: false,
+      reconnectAttempts: this.reconnectAttempts,
+      lastDisconnect: { at: Date.now(), error: trigger },
     });
 
     this.reconnectTimer = setTimeout(() => {
@@ -989,14 +1066,39 @@ class LanyingSession {
             attempt: this.reconnectAttempts,
             username: cfg.username,
           });
+          if (this.reconnectForceRecreate) {
+            logWarn("reconnect attempt will recreate sdk session", {
+              attempt: this.reconnectAttempts,
+              username: cfg.username,
+            });
+            await this.shutdown();
+            this.shuttingDown = false;
+          }
           await this.ensureReady(cfg);
           logWarn("reconnect attempt success", {
             attempt: this.reconnectAttempts,
             username: cfg.username,
           });
+          this.updateRuntimeStatus({
+            running: true,
+            connected: true,
+            reconnectAttempts: 0,
+            lastConnectedAt: Date.now(),
+            lastError: null,
+          });
           this.resetReconnectState("reconnect_success");
         } catch (err) {
           logError("reconnect attempt failed", err);
+          this.updateRuntimeStatus({
+            running: true,
+            connected: false,
+            reconnectAttempts: this.reconnectAttempts,
+            lastError: err instanceof Error ? err.message : String(err),
+            lastDisconnect: {
+              at: Date.now(),
+              error: err instanceof Error ? err.message : String(err),
+            },
+          });
           this.reconnectPromise = null;
           this.scheduleReconnect("reconnect_failed");
         }
@@ -1265,8 +1367,15 @@ class LanyingSession {
         password: account.password,
       });
 
-      logDebug("login success", {
+      logDebug("login request returned", {
         username: account.username,
+      });
+      this.updateRuntimeStatus({
+        running: true,
+        connected: true,
+        reconnectAttempts: 0,
+        lastConnectedAt: Date.now(),
+        lastError: null,
       });
 
       const deadline = Date.now() + READY_TIMEOUT_MS;
@@ -1289,8 +1398,16 @@ class LanyingSession {
       await this.loginPromise;
     } catch (err) {
       logError("login failed", err);
+      this.updateRuntimeStatus({
+        running: true,
+        connected: false,
+        lastError: err instanceof Error ? err.message : String(err),
+        lastDisconnect: {
+          at: Date.now(),
+          error: err instanceof Error ? err.message : String(err),
+        },
+      });
       this.loginPromise = null;
-      this.scheduleReconnect("ensureReady_login_failed");
       throw err;
     } finally {
       this.loginPromise = null;
@@ -1410,7 +1527,14 @@ class LanyingSession {
       }
       this.reconnectPromise = null;
       this.reconnectAttempts = 0;
+      this.reconnectForceRecreate = false;
       if (!this.client) {
+        this.updateRuntimeStatus({
+          running: false,
+          connected: false,
+          reconnectAttempts: 0,
+          lastStopAt: Date.now(),
+        });
         return;
       }
       const client = this.client;
@@ -1435,6 +1559,12 @@ class LanyingSession {
       this.loginPromise = null;
       this.selfId = "";
       this.onlineMarkerSent = false;
+      this.updateRuntimeStatus({
+        running: false,
+        connected: false,
+        reconnectAttempts: 0,
+        lastStopAt: Date.now(),
+      });
     })();
     this.shutdownPromise = run;
     try {
@@ -1632,10 +1762,18 @@ export const lanyingPlugin: ChannelPlugin<ResolvedLanyingAccount> = {
       ctx.log?.debug?.(
         `[lanying] resolved account: ${JSON.stringify(sanitizeAccountForLog(account))}`,
       );
+      session.bindRuntimeStatus({
+        accountId: ctx.accountId,
+        update: (next) => ctx.setStatus(next as any),
+      });
       ctx.setStatus({
         accountId: ctx.accountId,
         enabled: account.enabled,
         configured: account.configured,
+        running: false,
+        connected: false,
+        reconnectAttempts: 0,
+        lastStartAt: Date.now(),
       });
 
       await session.ensureReady(account);
@@ -1650,6 +1788,7 @@ export const lanyingPlugin: ChannelPlugin<ResolvedLanyingAccount> = {
       ctx.abortSignal.addEventListener(
         "abort",
         () => {
+          session.clearRuntimeStatus(ctx.accountId);
           void session.shutdown();
         },
         { once: true },
@@ -1671,6 +1810,7 @@ export const lanyingPlugin: ChannelPlugin<ResolvedLanyingAccount> = {
     },
     stopAccount: async (ctx) => {
       ctx.log?.info?.("[lanying] stopAccount called");
+      session.clearRuntimeStatus(ctx.accountId);
       await session.shutdown();
     },
   },
