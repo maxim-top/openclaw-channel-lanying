@@ -91,11 +91,20 @@ const READY_TIMEOUT_MS = 15_000;
 const READY_POLL_MS = 250;
 const RECONNECT_BASE_DELAY_MS = 2_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
+const CONFIG_PATCH_RETRY_MAX = 3;
+const CONFIG_PATCH_DEDUPE_TTL_MS = 60_000;
 const LOG_MASK = "******";
-const SENSITIVE_KEY_RE =
-  /(password|pass|pwd|api[_-]?key|token|secret|authorization|auth|cookie|session|private[_-]?key)/i;
-const SENSITIVE_INLINE_RE =
-  /((?:password|pass|pwd|api[_-]?key|token|secret|authorization|auth|cookie|session|private[_-]?key)\s*[:=]\s*["']?)([^"',\s}]+)(["']?)/gi;
+const SENSITIVE_KEY_PATTERN =
+  "(?:password|pass|pwd|api[_-]?key|token|secret|authorization|auth|cookie|session|private[_-]?key)";
+const SENSITIVE_KEY_RE = new RegExp(SENSITIVE_KEY_PATTERN, "i");
+const SENSITIVE_INLINE_RE = new RegExp(
+  `((?:${SENSITIVE_KEY_PATTERN})\\s*[:=]\\s*["']?)([^"',\\s}]+)(["']?)`,
+  "gi",
+);
+const SENSITIVE_ESCAPED_JSON_RE = new RegExp(
+  `((?:\\\\?["'])${SENSITIVE_KEY_PATTERN}(?:\\\\?["'])\\s*:\\s*(?:\\\\?["']))([^"\\\\]*(?:\\\\.[^"\\\\]*)*)(\\\\?["'])`,
+  "gi",
+);
 let consoleRedactionInstalled = false;
 
 installConsoleRedaction();
@@ -233,9 +242,16 @@ function redactString(value: string): string {
       // Fall back to inline replacement.
     }
   }
-  return value.replace(SENSITIVE_INLINE_RE, (_full, prefix: string, _secret: string, suffix: string) => {
-    return `${prefix}${LOG_MASK}${suffix}`;
-  });
+  return value
+    .replace(
+      SENSITIVE_ESCAPED_JSON_RE,
+      (_full, prefix: string, _secret: string, suffix: string) => {
+        return `${prefix}${LOG_MASK}${suffix}`;
+      },
+    )
+    .replace(SENSITIVE_INLINE_RE, (_full, prefix: string, _secret: string, suffix: string) => {
+      return `${prefix}${LOG_MASK}${suffix}`;
+    });
 }
 
 function redactForLog(value: unknown, parentKey = "", depth = 0): unknown {
@@ -422,6 +438,16 @@ function maybeParseJson(text: string): unknown {
 
 function stripAnsi(text: string): string {
   return text.replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function isConfigChangedSinceLastLoadError(err: unknown): boolean {
+  const text =
+    typeof err === "string"
+      ? err
+      : err instanceof Error
+        ? `${err.message}\n${err.stack ?? ""}`
+        : "";
+  return /config changed since last load; re-run config\.get and retry/i.test(text);
 }
 
 function parseJsonFromMixedText(text: string): unknown {
@@ -803,6 +829,8 @@ class LanyingSession {
     | ((next: Record<string, unknown> & { accountId?: string }) => void)
     | null = null;
   private runtimeAccountId: string | null = null;
+  private configPatchQueue: Promise<void> = Promise.resolve();
+  private recentConfigPatchByDigest = new Map<string, number>();
 
   bindRuntimeStatus(params: {
     accountId: string;
@@ -831,45 +859,85 @@ class LanyingSession {
   }
 
   private async applyOpenClawConfigPatch(rawPatch: string): Promise<void> {
-    logDebug("apply config patch requested", {
-      patchBytes: Buffer.byteLength(rawPatch, "utf8"),
-    });
-    const getResult = await runGatewayCall("config.get", {});
-    logDebug("config.get result summary", {
-      resultType: Array.isArray(getResult) ? "array" : typeof getResult,
-      rootKeys:
-        getResult && typeof getResult === "object" && !Array.isArray(getResult)
-          ? Object.keys(getResult as Record<string, unknown>).slice(0, 20)
-          : [],
-      hashCandidates: collectHashCandidates(getResult),
-    });
-    const baseHash = findBaseHash(getResult);
-    if (!baseHash) {
-      if (typeof getResult === "string") {
-        const cleaned = stripAnsi(getResult);
-        const hashLines = cleaned
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter((line) => /hash/i.test(line))
-          .slice(0, 8)
-          .map((line) => line.slice(0, 220));
-        logWarn("config.get string output debug", {
-          textBytes: Buffer.byteLength(getResult, "utf8"),
-          hasHashToken: /hash/i.test(cleaned),
-          hashLines,
-        });
+    const patchBytes = Buffer.byteLength(rawPatch, "utf8");
+    const digest = createHash("sha1").update(rawPatch).digest("hex").slice(0, 16);
+    logDebug("apply config patch requested", { patchBytes, digest });
+
+    const work = async (): Promise<void> => {
+      const now = Date.now();
+      for (const [key, ts] of this.recentConfigPatchByDigest.entries()) {
+        if (now - ts > CONFIG_PATCH_DEDUPE_TTL_MS) {
+          this.recentConfigPatchByDigest.delete(key);
+        }
       }
-      throw new Error("Failed to read baseHash from config.get output.");
-    }
-    logDebug("resolved baseHash for config.patch", {
-      baseHashPreview: baseHash.slice(0, 12),
-      baseHashLength: baseHash.length,
-    });
-    await runGatewayCall("config.patch", {
-      raw: rawPatch,
-      baseHash,
-    });
-    logDebug("config.patch call finished");
+      if (this.recentConfigPatchByDigest.has(digest)) {
+        logDebug("skip duplicated config patch in short window", { patchBytes, digest });
+        return;
+      }
+
+      let lastErr: unknown = null;
+      for (let attempt = 1; attempt <= CONFIG_PATCH_RETRY_MAX; attempt += 1) {
+        try {
+          const getResult = await runGatewayCall("config.get", {});
+          logDebug("config.get result summary", {
+            attempt,
+            resultType: Array.isArray(getResult) ? "array" : typeof getResult,
+            rootKeys:
+              getResult && typeof getResult === "object" && !Array.isArray(getResult)
+                ? Object.keys(getResult as Record<string, unknown>).slice(0, 20)
+                : [],
+            hashCandidates: collectHashCandidates(getResult),
+          });
+          const baseHash = findBaseHash(getResult);
+          if (!baseHash) {
+            if (typeof getResult === "string") {
+              const cleaned = stripAnsi(getResult);
+              const hashLines = cleaned
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .filter((line) => /hash/i.test(line))
+                .slice(0, 8)
+                .map((line) => line.slice(0, 220));
+              logWarn("config.get string output debug", {
+                attempt,
+                textBytes: Buffer.byteLength(getResult, "utf8"),
+                hasHashToken: /hash/i.test(cleaned),
+                hashLines,
+              });
+            }
+            throw new Error("Failed to read baseHash from config.get output.");
+          }
+          logDebug("resolved baseHash for config.patch", {
+            attempt,
+            baseHashPreview: baseHash.slice(0, 12),
+            baseHashLength: baseHash.length,
+          });
+          await runGatewayCall("config.patch", {
+            raw: rawPatch,
+            baseHash,
+          });
+          this.recentConfigPatchByDigest.set(digest, Date.now());
+          logDebug("config.patch call finished", { attempt, digest });
+          return;
+        } catch (err) {
+          lastErr = err;
+          if (attempt < CONFIG_PATCH_RETRY_MAX && isConfigChangedSinceLastLoadError(err)) {
+            logWarn("config.patch baseHash conflict; retrying", {
+              attempt,
+              maxAttempts: CONFIG_PATCH_RETRY_MAX,
+              digest,
+            });
+            continue;
+          }
+          throw err;
+        }
+      }
+      throw lastErr;
+    };
+
+    const queued = this.configPatchQueue.then(work, work);
+    this.configPatchQueue = queued.catch(() => undefined);
+    await queued;
   }
 
   private currentConfigKey(account: ResolvedLanyingAccount): string {
