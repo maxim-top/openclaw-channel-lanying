@@ -6,8 +6,8 @@ Lanying IM Channel for OpenClaw.
 
 - 使用蓝莺 IM Web SDK 接入 OpenClaw
 - 支持登录、收发文本消息
+- 支持私聊与群聊消息（可配置群策略、群白名单、群内触发规则）
 - 支持断线后的自动重连
-- 当前版本仅处理单聊消息（群聊事件会忽略）
 
 ## 安装
 
@@ -40,7 +40,19 @@ openclaw plugins install ./openclaw-channel-lanying
       "password": "xxxx",
       "allowManage": false,
       "dmPolicy": "open",
-      "allowFrom": ["*"]
+      "allowFrom": ["*"],
+      "groupPolicy": "open",
+      "groupAllowFrom": [],
+      "groups": {
+        "*": {
+          "requireMention": true
+        },
+        "123456": {
+          "enabled": true,
+          "requireMention": false,
+          "allowFrom": ["10001", "10002"]
+        }
+      }
     }
   }
 }
@@ -55,6 +67,12 @@ openclaw plugins install ./openclaw-channel-lanying
 - `allowManage`: 是否允许通过自发消息触发配置变更（默认 `false`）
 - `dmPolicy`: 私聊策略，常用 `open` 或 `pairing`
 - `allowFrom`: 允许发起对话的来源列表。`dmPolicy=open` 且未设置时会自动补为 `["*"]`。
+- `groupPolicy`: 群消息策略，`allowlist | open | disabled`（默认 `disabled`）。
+- `groupAllowFrom`: 群内允许触发机器人的发送者列表（空表示不限制发送者）。
+- `groups`: 允许的群配置，键为群 ID（支持 `"*"` 通配），每个群可配置：
+  - `enabled`: 是否启用该群（默认启用）
+  - `requireMention`: 是否要求 @ 触发（默认 `true`）
+  - `allowFrom`: 该群发送者白名单（优先级高于 `groupAllowFrom`）
 
 当 `allowManage=true` 时，若收到 `from` 和 `to` 都等于当前 `selfId` 的消息，且 `ext` 为：
 
@@ -78,9 +96,12 @@ openclaw gateway call config.patch --params '{"raw":"PATCH STRING","baseHash":"x
 
 配置生效并重启网关后：
 
-1. 用蓝莺账号向机器人账号发送私聊消息
-2. 插件收到消息后会转发给 OpenClaw
-3. OpenClaw 生成回复后由插件回发到蓝莺
+1. 私聊：用蓝莺账号向机器人账号发送私聊消息
+2. 群聊：按 `groupPolicy/groupAllowFrom/groups` 规则过滤后触发
+3. 插件收到消息后会转发给 OpenClaw
+4. OpenClaw 生成回复后由插件回发到蓝莺（群消息默认回原群）
+
+当群配置 `requireMention=true` 且消息未命中 @ 时，插件不会立即回复，但会把该消息缓存为群上下文；下一条命中 @ 的消息会连同这些上下文一起发送给 OpenClaw。
 
 ## 日志与排查
 
@@ -105,8 +126,13 @@ openclaw gateway call config.patch --params '{"raw":"PATCH STRING","baseHash":"x
 
 2. 收到消息但 OpenClaw 不回复
 
-- 当前只处理单聊；群聊不会触发回复
 - 历史消息、回环消息（`from === to`）和自发同步消息会被跳过
+- 群消息还需满足：
+  - `groupPolicy` 未禁用
+  - `groupPolicy=allowlist` 时命中 `groups`（可用 `"*"`）
+  - 发送者命中 `groups.<gid>.allowFrom` 或 `groupAllowFrom`（如果配置了）
+  - `requireMention=true` 时命中 @ 触发
+- 未命中 @ 的群消息会被记录为上下文，不会立即回复
 - 检查是否出现 `reply dispatcher skipped payload` 或 `reply dispatcher send failed`
 
 3. 断线后未恢复

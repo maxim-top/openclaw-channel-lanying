@@ -1,6 +1,14 @@
 export const LANYING_CHANNEL_ID = "lanying";
 export const LANYING_DEFAULT_ACCOUNT_ID = "default";
 
+export type LanyingGroupPolicy = "open" | "disabled" | "allowlist";
+
+export type LanyingGroupConfig = {
+  requireMention?: boolean;
+  enabled?: boolean;
+  allowFrom?: Array<string | number>;
+};
+
 export type LanyingChannelConfig = {
   enabled?: boolean;
   enable?: boolean;
@@ -11,6 +19,9 @@ export type LanyingChannelConfig = {
   allowManage?: boolean;
   dmPolicy?: string;
   allowFrom?: Array<string | number>;
+  groupPolicy?: LanyingGroupPolicy;
+  groupAllowFrom?: Array<string | number>;
+  groups?: Record<string, LanyingGroupConfig | undefined>;
   defaultTo?: string;
 };
 
@@ -24,6 +35,16 @@ export type ResolvedLanyingAccount = {
   allowManage: boolean;
   dmPolicy: string;
   allowFrom: string[];
+  groupPolicy: LanyingGroupPolicy;
+  groupAllowFrom: string[];
+  groups: Record<
+    string,
+    {
+      requireMention?: boolean;
+      enabled?: boolean;
+      allowFrom: string[];
+    }
+  >;
   defaultTo?: string;
 };
 

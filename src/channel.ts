@@ -90,6 +90,8 @@ const RECONNECT_BASE_DELAY_MS = 2_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const CONFIG_PATCH_RETRY_MAX = 3;
 const CONFIG_PATCH_DEDUPE_TTL_MS = 60_000;
+const GROUP_CONTEXT_MAX_MESSAGES = 30;
+const GROUP_CONTEXT_MAX_CHARS = 6_000;
 const LOG_MASK = "******";
 const SENSITIVE_KEY_PATTERN =
   "(?:password|pass|pwd|api[_-]?key|token|secret|authorization|auth|cookie|session|private[_-]?key)";
@@ -516,6 +518,55 @@ function parseExtValue(value: unknown): Record<string, unknown> | null {
   return null;
 }
 
+function parseConfigValue(value: unknown): Record<string, unknown> | null {
+  if (!value) {
+    return null;
+  }
+  if (typeof value === "string") {
+    const parsed = maybeParseJson(value);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return null;
+  }
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function hasSelfMentionInConfig(
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+  selfId: string,
+): boolean {
+  const selfNorm = selfId.trim();
+  if (!selfNorm) {
+    return false;
+  }
+  const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
+  const configCandidates = [
+    parseConfigValue((eventAny as { config?: unknown }).config),
+    parseConfigValue((meta as { config?: unknown }).config),
+    parseConfigValue(payload?.config),
+  ].filter(Boolean) as Record<string, unknown>[];
+
+  for (const config of configCandidates) {
+    const mentionListRaw = (config as { mentionList?: unknown; mention_list?: unknown }).mentionList
+      ?? (config as { mention_list?: unknown }).mention_list;
+    if (!Array.isArray(mentionListRaw)) {
+      continue;
+    }
+    for (const item of mentionListRaw) {
+      const mentionId = pickId(item);
+      if (mentionId && mentionId.trim() === selfNorm) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function extractConfigPatchRaw(
   eventAny: Record<string, unknown>,
   meta: Record<string, unknown>,
@@ -736,6 +787,159 @@ function extractText(event: LanyingInboundEvent): string {
   return "";
 }
 
+function normalizeAllowEntry(raw: unknown): string {
+  return String(raw ?? "")
+    .replace(/^lanying:/i, "")
+    .trim()
+    .toLowerCase();
+}
+
+function isAllowedByAllowlist(allowlist: string[], candidate: string): boolean {
+  if (allowlist.includes("*")) {
+    return true;
+  }
+  const normalized = normalizeAllowEntry(candidate);
+  if (!normalized) {
+    return false;
+  }
+  return allowlist.some((entry) => normalizeAllowEntry(entry) === normalized);
+}
+
+function parseGroupId(
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+  event: LanyingInboundEvent,
+): string {
+  const toType =
+    String(
+      (eventAny as { toType?: unknown }).toType ??
+        (eventAny as { to_type?: unknown }).to_type ??
+        (meta as { toType?: unknown }).toType ??
+        (meta as { to_type?: unknown }).to_type ??
+        "",
+    )
+      .trim()
+      .toLowerCase() || "";
+  const isGroupToType = toType === "group";
+  const groupIdByTo =
+    pickId(event.to) ||
+    pickId((eventAny as { to?: unknown }).to) ||
+    pickId((meta as { to?: unknown }).to);
+
+  if (isGroupToType && groupIdByTo) {
+    return groupIdByTo;
+  }
+
+  return (
+    pickId(event.gid) ||
+    pickId(event.group_id) ||
+    pickId(event.conversation_id) ||
+    pickId(eventAny.gid) ||
+    pickId((eventAny as { group_id?: unknown }).group_id) ||
+    pickId((eventAny as { conversation_id?: unknown }).conversation_id) ||
+    pickId(meta.gid) ||
+    pickId((meta as { group_id?: unknown }).group_id) ||
+    pickId((meta as { conversation_id?: unknown }).conversation_id) ||
+    groupIdByTo
+  );
+}
+
+function getGroupEntry(
+  account: ResolvedLanyingAccount,
+  groupId: string,
+): { entry?: ResolvedLanyingAccount["groups"][string]; source: "group" | "wildcard" | "none" } {
+  const groupEntry = account.groups[groupId];
+  if (groupEntry) {
+    return { entry: groupEntry, source: "group" };
+  }
+  const wildcard = account.groups["*"];
+  if (wildcard) {
+    return { entry: wildcard, source: "wildcard" };
+  }
+  return { source: "none" };
+}
+
+function isGroupAllowedByPolicy(account: ResolvedLanyingAccount, groupId: string): boolean {
+  if (account.groupPolicy === "disabled") {
+    return false;
+  }
+  const matched = getGroupEntry(account, groupId);
+  if (matched.entry?.enabled === false) {
+    return false;
+  }
+  if (account.groupPolicy === "open") {
+    return true;
+  }
+  return matched.source !== "none";
+}
+
+function isGroupSenderAllowed(
+  account: ResolvedLanyingAccount,
+  groupId: string,
+  senderId: string,
+): boolean {
+  if (!senderId) {
+    return false;
+  }
+  const matched = getGroupEntry(account, groupId);
+  const senderAllowFrom =
+    matched.entry && matched.entry.allowFrom.length > 0
+      ? matched.entry.allowFrom
+      : account.groupAllowFrom;
+  if (senderAllowFrom.length === 0) {
+    return true;
+  }
+  return isAllowedByAllowlist(senderAllowFrom, senderId);
+}
+
+function resolveGroupRequireMention(account: ResolvedLanyingAccount, groupId: string): boolean {
+  const groupEntry = account.groups[groupId];
+  if (typeof groupEntry?.requireMention === "boolean") {
+    return groupEntry.requireMention;
+  }
+  const wildcardEntry = account.groups["*"];
+  if (typeof wildcardEntry?.requireMention === "boolean") {
+    return wildcardEntry.requireMention;
+  }
+  return true;
+}
+
+function hasMentionHint(
+  _body: string,
+  selfId: string,
+  _username: string,
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+  eventName?: string,
+): boolean {
+  if (hasSelfMentionInConfig(eventAny, meta, selfId)) {
+    return true;
+  }
+  if (eventName === "onMentionMessage") {
+    return true;
+  }
+  return false;
+}
+
+function resolveSenderNameFromConfig(
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+): string {
+  const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
+  const configCandidates = [
+    parseConfigValue((eventAny as { config?: unknown }).config),
+    parseConfigValue((meta as { config?: unknown }).config),
+    parseConfigValue(payload?.config),
+  ].filter(Boolean) as Record<string, unknown>[];
+  for (const config of configCandidates) {
+    const nickname = (config.senderNickname ?? config.sender_nickname) as unknown;
+    if (typeof nickname === "string" && nickname.trim()) {
+      return nickname.trim();
+    }
+  }
+  return "";
+}
+
 function normalizeTarget(raw: string): LanyingMessageTarget | null {
   const trimmed = raw.trim();
   if (!trimmed) {
@@ -761,6 +965,9 @@ function sanitizeAccountForLog(account: ResolvedLanyingAccount): Record<string, 
     username: account.username,
     dmPolicy: account.dmPolicy,
     allowFromCount: account.allowFrom.length,
+    groupPolicy: account.groupPolicy,
+    groupAllowFromCount: account.groupAllowFrom.length,
+    groupsCount: Object.keys(account.groups).length,
   };
 }
 
@@ -795,6 +1002,38 @@ function resolveLanyingAccount(cfg: OpenClawConfig): ResolvedLanyingAccount {
     .map((entry) => String(entry).trim())
     .filter(Boolean);
   const allowFrom = dmPolicy === "open" && parsedAllowFrom.length === 0 ? ["*"] : parsedAllowFrom;
+  const rawGroupPolicy = String(channelCfg.groupPolicy ?? "disabled").trim().toLowerCase();
+  const groupPolicy: ResolvedLanyingAccount["groupPolicy"] =
+    rawGroupPolicy === "open" || rawGroupPolicy === "disabled" || rawGroupPolicy === "allowlist"
+      ? rawGroupPolicy
+      : "allowlist";
+  const groupAllowFrom = (channelCfg.groupAllowFrom ?? [])
+    .map((entry) => String(entry).trim())
+    .filter(Boolean);
+  const groupsRaw = channelCfg.groups;
+  const groups: ResolvedLanyingAccount["groups"] = {};
+  if (groupsRaw && typeof groupsRaw === "object" && !Array.isArray(groupsRaw)) {
+    for (const [groupIdRaw, value] of Object.entries(groupsRaw)) {
+      const groupId = String(groupIdRaw).trim();
+      if (!groupId || !value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      const groupObj = value as {
+        requireMention?: unknown;
+        enabled?: unknown;
+        allowFrom?: unknown;
+      };
+      const allowFrom = Array.isArray(groupObj.allowFrom)
+        ? groupObj.allowFrom.map((entry) => String(entry).trim()).filter(Boolean)
+        : [];
+      groups[groupId] = {
+        requireMention:
+          typeof groupObj.requireMention === "boolean" ? groupObj.requireMention : undefined,
+        enabled: typeof groupObj.enabled === "boolean" ? groupObj.enabled : undefined,
+        allowFrom,
+      };
+    }
+  }
 
   return {
     accountId: LANYING_DEFAULT_ACCOUNT_ID,
@@ -806,6 +1045,9 @@ function resolveLanyingAccount(cfg: OpenClawConfig): ResolvedLanyingAccount {
     allowManage: channelCfg.allowManage === true,
     dmPolicy,
     allowFrom,
+    groupPolicy,
+    groupAllowFrom,
+    groups,
     defaultTo: channelCfg.defaultTo?.trim() || undefined,
   };
 }
@@ -833,6 +1075,48 @@ class LanyingSession {
   private runtimeAccountId: string | null = null;
   private configPatchQueue: Promise<void> = Promise.resolve();
   private recentConfigPatchByDigest = new Map<string, number>();
+  private pendingGroupContext = new Map<
+    string,
+    Array<{ senderId: string; senderName?: string; body: string; timestamp: number }>
+  >();
+
+  private appendPendingGroupContext(params: {
+    groupId: string;
+    senderId: string;
+    senderName?: string;
+    body: string;
+    timestamp: number;
+  }): void {
+    const current = this.pendingGroupContext.get(params.groupId) ?? [];
+    current.push({
+      senderId: params.senderId,
+      senderName: params.senderName,
+      body: params.body,
+      timestamp: params.timestamp,
+    });
+    while (current.length > GROUP_CONTEXT_MAX_MESSAGES) {
+      current.shift();
+    }
+    let totalChars = current.reduce((acc, item) => acc + item.body.length, 0);
+    while (current.length > 0 && totalChars > GROUP_CONTEXT_MAX_CHARS) {
+      const removed = current.shift();
+      totalChars -= removed?.body.length ?? 0;
+    }
+    this.pendingGroupContext.set(params.groupId, current);
+  }
+
+  private consumePendingGroupContext(groupId: string): string {
+    const pending = this.pendingGroupContext.get(groupId) ?? [];
+    if (pending.length === 0) {
+      return "";
+    }
+    this.pendingGroupContext.delete(groupId);
+    const lines = pending.map((item) => {
+      const speaker = item.senderName?.trim() || item.senderId;
+      return `[${speaker}] ${item.body}`;
+    });
+    return `[Group context messages since last trigger]\n${lines.join("\n")}`;
+  }
 
   bindRuntimeStatus(params: {
     accountId: string;
@@ -970,11 +1254,11 @@ class LanyingSession {
       if (!isHistoryEvent(eventAny, meta)) {
         logDebug(`inbound event: ${name}`, event);
       }
-      void this.onInbound(event as LanyingInboundEvent, "direct", account);
+      void this.onInbound(event as LanyingInboundEvent, "direct", account, name);
     };
     const onGroup = (name: string, event: unknown) => {
       logDebug(`inbound event: ${name}`, event);
-      logDebug("skip group event (direct-only mode)", { name });
+      void this.onInbound(event as LanyingInboundEvent, "group", account, name);
     };
 
     // Subscribe only to documented public events from floo-web types.
@@ -988,7 +1272,7 @@ class LanyingSession {
       onGroupMessageContentAppend: (event: unknown) =>
         onGroup("onGroupMessageContentAppend", event),
       onGroupMessageReplace: (event: unknown) => onGroup("onGroupMessageReplace", event),
-      onMentionMessage: (event: unknown) => onGroup("onMentionMessage", event),
+      onMentionMessage: (event: unknown) => logDebug("onMentionMessage event ignored", event),
       onReceiveHistoryMsg: (event: unknown) => logDebug("onReceiveHistoryMsg event", event),
       onMessageStatusChanged: (event: unknown) => logDebug("onMessageStatusChanged event", event),
       onSendingMessageStatusChanged: (event: unknown) => {
@@ -1193,12 +1477,9 @@ class LanyingSession {
     event: LanyingInboundEvent,
     mode: "direct" | "group",
     account: ResolvedLanyingAccount,
+    eventName?: string,
   ): Promise<void> {
     try {
-      if (mode !== "direct") {
-        logDebug("skip non-direct inbound", { mode });
-        return;
-      }
       const eventAny = event as Record<string, unknown>;
       const meta = (eventAny.meta ?? eventAny) as Record<string, unknown>;
       const isHistory = isHistoryEvent(eventAny, meta);
@@ -1215,40 +1496,47 @@ class LanyingSession {
         pickId((event as { sender?: unknown }).sender) ||
         pickId((event as { uid?: unknown }).uid) ||
         pickId(meta.from);
-
-      const toId =
+      const toIdRaw =
         pickId(event.to) ||
         pickId((event as { to_id?: unknown }).to_id) ||
         pickId(meta.to) ||
         pickId(meta.uid) ||
         pickId(meta.xid);
+      const groupId = parseGroupId(eventAny, meta, event);
       const directPeer =
         pickId(event.from) ||
         pickId((event as { to_id?: unknown }).to_id) ||
         pickId((event as { xid?: unknown }).xid) ||
-        toId;
-      const targetId = directPeer;
+        toIdRaw;
+      const targetId = mode === "group" ? groupId : directPeer;
       if (!targetId) {
-        logWarn("inbound message missing target id", { mode, event });
+        logWarn("inbound message missing target id", {
+          mode,
+          eventName,
+          senderId,
+          toId: toIdRaw,
+          groupId,
+          event,
+        });
         return;
       }
       this.updateSelfIdFromClient("inbound event");
       const configPatchRaw = extractConfigPatchRaw(eventAny, meta);
-      if (senderId && toId && senderId === toId) {
+      if (mode === "direct" && senderId && toIdRaw && senderId === toIdRaw) {
         const isSelfLoopback = Boolean(this.selfId && senderId === this.selfId);
         if (isSelfLoopback && account.allowManage && configPatchRaw) {
           try {
             await this.applyOpenClawConfigPatch(configPatchRaw);
             logDebug("applied config patch from self loopback message", {
               senderId,
-              toId,
+              toId: toIdRaw,
               patchBytes: Buffer.byteLength(configPatchRaw, "utf8"),
             });
           } catch (err) {
             logError("failed to apply config patch from self loopback message", {
               err,
               senderId,
-              toId,
+              toId: toIdRaw,
               selfId: this.selfId,
               allowManage: account.allowManage,
               hasConfigPatch: Boolean(configPatchRaw),
@@ -1259,10 +1547,19 @@ class LanyingSession {
         }
         logDebug("skip loopback message (from === to)", {
           senderId,
-          toId,
+          toId: toIdRaw,
           selfId: this.selfId,
           allowManage: account.allowManage,
           hasConfigPatch: Boolean(configPatchRaw),
+        });
+        return;
+      }
+      if (senderId && this.selfId && senderId === this.selfId) {
+        logDebug("skip self/multi-device sync message", {
+          senderId,
+          toId: toIdRaw,
+          targetId,
+          mode,
         });
         return;
       }
@@ -1272,16 +1569,63 @@ class LanyingSession {
         logDebug("skip empty inbound", { mode, eventType: event.type });
         return;
       }
+      const timestampNum = Number(
+        eventAny.timestamp ?? meta.timestamp ?? (eventAny as { ts?: unknown }).ts ?? Date.now(),
+      );
 
-      if (senderId && this.selfId && senderId === this.selfId) {
-        logDebug("skip self/multi-device sync message", { senderId, toId, targetId });
-        return;
+      if (mode === "group") {
+        if (!isGroupAllowedByPolicy(account, groupId)) {
+          logDebug("skip group inbound by groupPolicy", {
+            groupPolicy: account.groupPolicy,
+            groupId,
+            eventName,
+          });
+          return;
+        }
+        if (!senderId) {
+          logWarn("skip group inbound: sender id missing", {
+            groupId,
+            eventName,
+          });
+          return;
+        }
+        if (!isGroupSenderAllowed(account, groupId, senderId)) {
+          logDebug("skip group inbound: sender not allowed", {
+            groupId,
+            senderId,
+            eventName,
+          });
+          return;
+        }
+        const requireMention = resolveGroupRequireMention(account, groupId);
+        if (
+          !hasMentionHint(body, this.selfId, account.username, eventAny, meta, eventName) &&
+          requireMention
+        ) {
+          this.appendPendingGroupContext({
+            groupId,
+            senderId,
+            senderName: resolveSenderNameFromConfig(eventAny, meta) || undefined,
+            body,
+            timestamp: Number.isFinite(timestampNum) ? timestampNum : Date.now(),
+          });
+          logDebug("skip group inbound: mention required", {
+            groupId,
+            senderId,
+            eventName,
+            requireMention,
+            queuedAsContext: true,
+          });
+          return;
+        }
       }
 
       logDebug("inbound message", {
         mode,
+        eventName,
+        groupId: mode === "group" ? groupId : undefined,
         senderId,
-        toId,
+        toId: toIdRaw,
         targetId,
         bodyPreview: body.slice(0, 80),
         keys: Object.keys(meta),
@@ -1302,8 +1646,8 @@ class LanyingSession {
       if (
         mode === "direct" &&
         senderId &&
-        toId &&
-        senderId !== toId &&
+        toIdRaw &&
+        senderId !== toIdRaw &&
         senderId !== this.selfId &&
         senderUid !== null &&
         inboundMid
@@ -1315,7 +1659,7 @@ class LanyingSession {
             senderUid,
             mid: inboundMid,
             senderId,
-            toId,
+            toId: toIdRaw,
           });
         } catch (err) {
           logWarn("failed to mark inbound direct message as read", {
@@ -1323,25 +1667,49 @@ class LanyingSession {
             senderUid,
             mid: inboundMid ?? undefined,
             senderId,
-            toId,
+            toId: toIdRaw,
           });
         }
       }
-      const timestampNum = Number(
-        eventAny.timestamp ?? meta.timestamp ?? (eventAny as { ts?: unknown }).ts ?? Date.now(),
-      );
+      let bodyToDispatch = body;
+      if (mode === "group") {
+        const pendingContext = this.consumePendingGroupContext(groupId);
+        if (pendingContext) {
+          bodyToDispatch = `${pendingContext}\n\n[Current message]\n${body}`;
+          const contextBytes = Buffer.byteLength(pendingContext, "utf8");
+          const contextPreview = Buffer.from(pendingContext, "utf8").subarray(0, 4096).toString("utf8");
+          logDebug("group pending context attached", {
+            groupId,
+            contextBytes,
+            contextPreview,
+            contextPreviewTruncated: contextBytes > 4096,
+          });
+        }
+      }
+      const dispatchTo = mode === "group" ? groupId : toIdRaw || account.username;
+      const sessionKey = mode === "group" ? `group:${groupId}` : targetId;
+      const outboundTarget: LanyingMessageTarget =
+        mode === "group"
+          ? {
+              kind: "group",
+              id: groupId,
+            }
+          : {
+              kind: "user",
+              id: targetId,
+            };
 
       const result = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx: {
-          Body: body,
+          Body: bodyToDispatch,
           From: senderId || targetId,
-          To: toId || account.username,
-          SessionKey: targetId,
+          To: dispatchTo,
+          SessionKey: sessionKey,
           AccountId: account.accountId,
           MessageSid: messageSid || undefined,
           Timestamp: Number.isFinite(timestampNum) ? timestampNum : Date.now(),
           OriginatingChannel: LANYING_CHANNEL_ID as any,
-          OriginatingTo: targetId,
+          OriginatingTo: mode === "group" ? groupId : targetId,
           ChatType: mode,
           Provider: LANYING_CHANNEL_ID,
           Surface: LANYING_CHANNEL_ID,
@@ -1355,14 +1723,7 @@ class LanyingSession {
             if (!response.trim()) {
               return;
             }
-            await this.sendText(
-              {
-                kind: "user",
-                id: targetId,
-              },
-              response,
-              account,
-            );
+            await this.sendText(outboundTarget, response, account);
           },
           onError: (err: unknown, info: { kind: "tool" | "block" | "final" }) => {
             logError(`reply dispatcher send failed (kind=${info.kind})`, err);
@@ -1699,6 +2060,30 @@ export const lanyingPlugin: any = {
             oneOf: [{ type: "string" }, { type: "number" }],
           },
         },
+        groupPolicy: { type: "string", enum: ["open", "disabled", "allowlist"] },
+        groupAllowFrom: {
+          type: "array",
+          items: {
+            oneOf: [{ type: "string" }, { type: "number" }],
+          },
+        },
+        groups: {
+          type: "object",
+          additionalProperties: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              requireMention: { type: "boolean" },
+              enabled: { type: "boolean" },
+              allowFrom: {
+                type: "array",
+                items: {
+                  oneOf: [{ type: "string" }, { type: "number" }],
+                },
+              },
+            },
+          },
+        },
         defaultTo: { type: "string" },
       },
     },
@@ -1735,6 +2120,18 @@ export const lanyingPlugin: any = {
         label: "Allow From",
         help: 'Allowed senders. With dmPolicy="open", an empty list is treated as ["*"].',
       },
+      groupPolicy: {
+        label: "Group Policy",
+        help: 'Group inbound policy: "allowlist", "open", or "disabled".',
+      },
+      groupAllowFrom: {
+        label: "Group Allow From",
+        help: "Allowed senders in groups. Empty means no sender restriction.",
+      },
+      groups: {
+        label: "Groups",
+        help: 'Allowed groups map. Use group ID keys (or "*" wildcard) with requireMention/enabled.',
+      },
       defaultTo: {
         label: "Default Target",
         help: "Default outbound target when no explicit target is provided.",
@@ -1753,6 +2150,9 @@ export const lanyingPlugin: any = {
       configured: account.configured,
       allowManage: account.allowManage,
       dmPolicy: account.dmPolicy,
+      groupPolicy: account.groupPolicy,
+      groupAllowFromCount: account.groupAllowFrom?.length ?? 0,
+      groupsCount: Object.keys(account.groups ?? {}).length,
     }),
     resolveAllowFrom: ({ cfg }: any) => resolveLanyingAccount(cfg).allowFrom,
     formatAllowFrom: ({ allowFrom }: any) =>
@@ -1787,6 +2187,16 @@ export const lanyingPlugin: any = {
       if (account.enabled && !account.configured) {
         return [
           '- Lanying is enabled but not configured. Set channels.lanying.appId, channels.lanying.username, channels.lanying.password.',
+        ];
+      }
+      if (
+        account.enabled &&
+        account.configured &&
+        account.groupPolicy === "allowlist" &&
+        Object.keys(account.groups ?? {}).length === 0
+      ) {
+        return [
+          '- Lanying groups: groupPolicy="allowlist" but no channels.lanying.groups configured; group messages will be blocked.',
         ];
       }
       return [];
