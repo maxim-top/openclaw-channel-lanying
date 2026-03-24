@@ -42,7 +42,7 @@ openclaw plugins install ./openclaw-channel-lanying
       "dmPolicy": "open",
       "allowFrom": ["*"],
       "groupPolicy": "open",
-      "groupAllowFrom": [],
+      "groupAllowFrom": ["*"],
       "groups": {
         "*": {
           "requireMention": true
@@ -68,7 +68,7 @@ openclaw plugins install ./openclaw-channel-lanying
 - `dmPolicy`: 私聊策略，常用 `open` 或 `pairing`
 - `allowFrom`: 允许发起对话的来源列表。`dmPolicy=open` 且未设置时会自动补为 `["*"]`。
 - `groupPolicy`: 群消息策略，`allowlist | open | disabled`（默认 `disabled`）。
-- `groupAllowFrom`: 群内允许触发机器人的发送者列表（空表示不限制发送者）。
+- `groupAllowFrom`: 群内允许触发机器人的发送者列表。未配置或 `[]` 表示不允许任何发送者；`["*"]` 表示允许所有发送者。
 - `groups`: 允许的群配置，键为群 ID（支持 `"*"` 通配），每个群可配置：
   - `enabled`: 是否启用该群（默认启用）
   - `requireMention`: 是否要求 @ 触发（默认 `true`）
@@ -130,7 +130,7 @@ openclaw gateway call config.patch --params '{"raw":"PATCH STRING","baseHash":"x
 - 群消息还需满足：
   - `groupPolicy` 未禁用
   - `groupPolicy=allowlist` 时命中 `groups`（可用 `"*"`）
-  - 发送者命中 `groups.<gid>.allowFrom` 或 `groupAllowFrom`（如果配置了）
+  - 发送者命中 `groups.<gid>.allowFrom` 或 `groupAllowFrom`（未配置/`[]` 拒绝所有，`["*"]` 允许所有）
   - `requireMention=true` 时命中 @ 触发
 - 未命中 @ 的群消息会被记录为上下文，不会立即回复
 - 检查是否出现 `reply dispatcher skipped payload` 或 `reply dispatcher send failed`

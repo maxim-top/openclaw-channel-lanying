@@ -887,7 +887,7 @@ function isGroupSenderAllowed(
       ? matched.entry.allowFrom
       : account.groupAllowFrom;
   if (senderAllowFrom.length === 0) {
-    return true;
+    return false;
   }
   return isAllowedByAllowlist(senderAllowFrom, senderId);
 }
