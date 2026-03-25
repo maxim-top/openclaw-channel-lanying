@@ -92,6 +92,51 @@ openclaw gateway call config.get --params '{}'
 openclaw gateway call config.patch --params '{"raw":"PATCH STRING","baseHash":"xxxxxxx"}'
 ```
 
+同样在 `allowManage=true` 下，支持中转请求消息：
+
+```json
+{
+  "openclaw": {
+    "type": "router_request",
+    "message": {
+      "id": "req-1",
+      "from": "10001",
+      "to": "10002",
+      "content": "你好",
+      "type": "text",
+      "timestamp": "1710000000000",
+      "toType": "roster"
+    }
+  }
+}
+```
+
+插件只会用 `selfId -> selfId` 的消息返回 `router_reply`，不会走普通外发回复链路：
+
+```json
+{
+  "openclaw": {
+    "type": "router_reply",
+    "message": {
+      "id": "router_reply_1710000000001",
+      "from": "10002",
+      "to": "10001",
+      "content": "你好！",
+      "type": "text",
+      "ext": "",
+      "config": "",
+      "attach": "",
+      "status": 1,
+      "timestamp": "1710000000001",
+      "toType": "roster"
+    }
+  },
+  "ai": {
+    "role": "ai"
+  }
+}
+```
+
 ## 使用
 
 配置生效并重启网关后：
@@ -127,6 +172,7 @@ openclaw gateway call config.patch --params '{"raw":"PATCH STRING","baseHash":"x
 2. 收到消息但 OpenClaw 不回复
 
 - 历史消息、回环消息（`from === to`）和自发同步消息会被跳过
+- 自环 `router_reply` 会被显式忽略，避免回环递归
 - 群消息还需满足：
   - `groupPolicy` 未禁用
   - `groupPolicy=allowlist` 时命中 `groups`（可用 `"*"`）

@@ -595,6 +595,77 @@ function extractConfigPatchRaw(
   return null;
 }
 
+function parseMetaMessage(value: unknown): Record<string, unknown> | null {
+  if (!value) {
+    return null;
+  }
+  if (typeof value === "string") {
+    const parsed = maybeParseJson(value);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return null;
+  }
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function extractRouterSignal(
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+): { type: "router_request"; message: Record<string, unknown> } | { type: "router_reply" } | null {
+  const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
+  const extObjCandidates = [
+    parseExtValue(eventAny.ext),
+    parseExtValue(meta.ext),
+    parseExtValue(payload?.ext),
+  ].filter(Boolean) as Record<string, unknown>[];
+
+  for (const extObj of extObjCandidates) {
+    const openclaw = extObj.openclaw;
+    if (!openclaw || typeof openclaw !== "object" || Array.isArray(openclaw)) {
+      continue;
+    }
+    const openclawObj = openclaw as Record<string, unknown>;
+    const signalType = String(openclawObj.type ?? "").trim();
+    if (signalType === "router_reply") {
+      return { type: "router_reply" };
+    }
+    if (signalType !== "router_request") {
+      continue;
+    }
+    const message = parseMetaMessage(openclawObj.message);
+    if (message) {
+      return {
+        type: "router_request",
+        message,
+      };
+    }
+    logWarn("skip router_request: openclaw.message is invalid", {
+      signalType,
+      messageType: typeof openclawObj.message,
+    });
+  }
+  return null;
+}
+
+function isCommandOuterMessage(
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+): boolean {
+  const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
+  const rawTypeCandidates = [
+    eventAny.type,
+    meta.type,
+    payload?.type,
+    (eventAny as { messageType?: unknown }).messageType,
+    (meta as { messageType?: unknown }).messageType,
+  ];
+  return rawTypeCandidates.some((value) => String(value ?? "").trim().toLowerCase() === "command");
+}
+
 async function runGatewayCall(command: string, params: Record<string, unknown>): Promise<unknown> {
   const args = ["gateway", "call", command, "--params", JSON.stringify(params)];
   logDebug("exec openclaw gateway call", {
@@ -1473,6 +1544,152 @@ class LanyingSession {
     }, delay);
   }
 
+  private async sendRouterReplyToSelf(message: Record<string, unknown>): Promise<void> {
+    if (!this.client || !this.selfId) {
+      logWarn("skip router_reply: client or selfId unavailable", {
+        hasClient: Boolean(this.client),
+        hasSelfId: Boolean(this.selfId),
+      });
+      return;
+    }
+    await this.client.sysManage.sendRosterMessage({
+      type: "command",
+      uid: this.selfId,
+      content: "",
+      ext: JSON.stringify({
+        openclaw: {
+          type: "router_reply",
+          message,
+        },
+        ai: {
+          role: "ai",
+        },
+      }),
+    });
+  }
+
+  private async handleRouterRequest(
+    routerMessage: Record<string, unknown>,
+    account: ResolvedLanyingAccount,
+  ): Promise<void> {
+    const body = extractText(routerMessage as LanyingInboundEvent);
+    if (!body.trim()) {
+      logWarn("skip router_request: message.content is empty", {
+        keys: Object.keys(routerMessage),
+      });
+      return;
+    }
+    const fromId =
+      pickId(routerMessage.from) ||
+      pickId((routerMessage as { sender_id?: unknown }).sender_id) ||
+      this.selfId;
+    const toId =
+      pickId(routerMessage.to) ||
+      pickId((routerMessage as { uid?: unknown }).uid) ||
+      this.selfId;
+    const messageSid =
+      pickId(routerMessage.id) || pickId((routerMessage as { message_id?: unknown }).message_id);
+    const toType = String(
+      (routerMessage as { toType?: unknown }).toType ??
+        (routerMessage as { to_type?: unknown }).to_type ??
+        "",
+    )
+      .trim()
+      .toLowerCase();
+    const groupId =
+      pickId((routerMessage as { gid?: unknown }).gid) ||
+      pickId((routerMessage as { group_id?: unknown }).group_id) ||
+      pickId((routerMessage as { conversation_id?: unknown }).conversation_id) ||
+      (toType === "group" ? toId : "");
+    const chatType: "direct" | "group" = groupId ? "group" : "direct";
+    const timestampNum = Number(
+      (routerMessage as { timestamp?: unknown }).timestamp ??
+        (routerMessage as { ts?: unknown }).ts ??
+        Date.now(),
+    );
+    const routerRelayMark = true;
+    const runtime = getLanyingRuntime();
+    const cfg = await runtime.config.loadConfig();
+    let replySeq = 0;
+    let deliveredCount = 0;
+    const dispatchTo = chatType === "group" ? groupId : toId || this.selfId;
+    const sessionKey =
+      chatType === "group"
+        ? `router:group:${groupId}`
+        : `router:direct:${fromId || toId || this.selfId || LANYING_CHANNEL_ID}`;
+
+    const result = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: {
+        Body: body,
+        From: fromId || toId || this.selfId,
+        To: dispatchTo,
+        SessionKey: sessionKey,
+        RouterRelay: routerRelayMark,
+        AccountId: account.accountId,
+        MessageSid: messageSid || undefined,
+        Timestamp: Number.isFinite(timestampNum) ? timestampNum : Date.now(),
+        OriginatingChannel: LANYING_CHANNEL_ID as any,
+        OriginatingTo: chatType === "group" ? groupId : toId || this.selfId,
+        ChatType: chatType,
+        Provider: LANYING_CHANNEL_ID,
+        Surface: LANYING_CHANNEL_ID,
+        SenderId: fromId || undefined,
+        SenderName: fromId || undefined,
+      },
+      cfg,
+      dispatcherOptions: {
+        deliver: async (payload: { text?: string; body?: string }) => {
+          const response = (payload?.text ?? payload?.body ?? "").trim();
+          if (!response) {
+            return;
+          }
+          replySeq += 1;
+          const now = Date.now();
+          const replyMessage: Record<string, unknown> = {
+            id: `router_reply_${now}_${replySeq}`,
+            from: this.selfId || toId || fromId,
+            to: chatType === "group" ? groupId : fromId || this.selfId,
+            content: response,
+            type: "text",
+            ext: "",
+            config: "",
+            attach: "",
+            status: 1,
+            timestamp: String(now),
+            toType: chatType === "group" ? "group" : "roster",
+          };
+          await this.sendRouterReplyToSelf(replyMessage);
+          deliveredCount += 1;
+        },
+        onError: (err: unknown, info: { kind: "tool" | "block" | "final" }) => {
+          logError(`router_request dispatcher failed (kind=${info.kind})`, err);
+        },
+        onSkip: (
+          payload: { text?: string; body?: string },
+          info: { kind: "tool" | "block" | "final"; reason: string },
+        ) => {
+          logDebug(
+            `router_request dispatcher skipped payload (kind=${info.kind}, reason=${info.reason})`,
+            {
+              textPreview: (payload.text ?? payload.body ?? "").slice(0, 80),
+            },
+          );
+        },
+      },
+    });
+    logDebug("router_request dispatcher result", result);
+    if (deliveredCount === 0) {
+      logDebug("router_request produced empty replies; no router_reply sent");
+      return;
+    }
+    logDebug("router_reply stream sent for router_request", {
+      requestSid: messageSid || undefined,
+      requestFrom: fromId || undefined,
+      replyTo: this.selfId,
+      deliveredCount,
+    });
+  }
+
   private async onInbound(
     event: LanyingInboundEvent,
     mode: "direct" | "group",
@@ -1522,6 +1739,7 @@ class LanyingSession {
       }
       this.updateSelfIdFromClient("inbound event");
       const configPatchRaw = extractConfigPatchRaw(eventAny, meta);
+      const routerSignal = extractRouterSignal(eventAny, meta);
       if (mode === "direct" && senderId && toIdRaw && senderId === toIdRaw) {
         const isSelfLoopback = Boolean(this.selfId && senderId === this.selfId);
         if (isSelfLoopback && account.allowManage && configPatchRaw) {
@@ -1545,12 +1763,38 @@ class LanyingSession {
           }
           return;
         }
+        if (routerSignal?.type === "router_reply") {
+          logDebug("skip loopback router_reply", {
+            senderId,
+            toId: toIdRaw,
+            selfId: this.selfId,
+          });
+          return;
+        }
+        if (isSelfLoopback && account.allowManage && routerSignal?.type === "router_request") {
+          if (!isCommandOuterMessage(eventAny, meta)) {
+            logDebug("skip loopback router_request: outer type is not command", {
+              senderId,
+              toId: toIdRaw,
+              selfId: this.selfId,
+            });
+            return;
+          }
+          logDebug("processing loopback router_request", {
+            senderId,
+            toId: toIdRaw,
+            selfId: this.selfId,
+          });
+          await this.handleRouterRequest(routerSignal.message, account);
+          return;
+        }
         logDebug("skip loopback message (from === to)", {
           senderId,
           toId: toIdRaw,
           selfId: this.selfId,
           allowManage: account.allowManage,
           hasConfigPatch: Boolean(configPatchRaw),
+          routerSignalType: routerSignal?.type ?? "",
         });
         return;
       }
