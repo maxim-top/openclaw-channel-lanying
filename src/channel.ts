@@ -4,8 +4,6 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
-import { execFile as execFileCb } from "node:child_process";
-import { promisify } from "node:util";
 import { getLanyingRuntime } from "./runtime.js";
 import {
   LANYING_CHANNEL_ID,
@@ -83,7 +81,6 @@ const sdkModulePath = path.resolve(
   "./lanying-im-sdk/floo-3.0.0.js",
 );
 let cachedFlooFactory: FlooFactory | null = null;
-const execFile = promisify(execFileCb);
 const READY_TIMEOUT_MS = 15_000;
 const READY_POLL_MS = 250;
 const RECONNECT_BASE_DELAY_MS = 2_000;
@@ -220,7 +217,7 @@ function ensureXmlHttpRequestPolyfill(): void {
   if (typeof (globalThis as { XMLHttpRequest?: unknown }).XMLHttpRequest !== "undefined") {
     return;
   }
-  (globalThis as { XMLHttpRequest: typeof NodeXmlHttpRequest }).XMLHttpRequest =
+  (globalThis as unknown as { XMLHttpRequest: typeof NodeXmlHttpRequest }).XMLHttpRequest =
     NodeXmlHttpRequest;
   logDebug("installed XMLHttpRequest polyfill for lanying sdk");
 }
@@ -437,6 +434,13 @@ function maybeParseJson(text: string): unknown {
   } catch {
     return null;
   }
+}
+
+function asPlainObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
 }
 
 function stripAnsi(text: string): string {
@@ -667,16 +671,47 @@ function isCommandOuterMessage(
 }
 
 async function runGatewayCall(command: string, params: Record<string, unknown>): Promise<unknown> {
-  const args = ["gateway", "call", command, "--params", JSON.stringify(params)];
+  const runtime = getLanyingRuntime();
+  const argv = ["openclaw", "gateway", "call", command, "--params", JSON.stringify(params)];
   logDebug("exec openclaw gateway call", {
     command,
     paramsKeys: Object.keys(params),
   });
-  const { stdout, stderr } = await execFile("openclaw", args, {
-    maxBuffer: 2 * 1024 * 1024,
+  const result = await runtime.system.runCommandWithTimeout(argv, {
+    timeoutMs: 30_000,
   });
+  const resultObj = asPlainObject(result);
+  const stdout =
+    typeof resultObj?.stdout === "string"
+      ? resultObj.stdout
+      : typeof resultObj?.output === "string"
+        ? resultObj.output
+        : typeof result === "string"
+          ? result
+          : "";
+  const stderr =
+    typeof resultObj?.stderr === "string"
+      ? resultObj.stderr
+      : typeof resultObj?.error === "string"
+        ? resultObj.error
+        : "";
+  const exitCode =
+    typeof resultObj?.exitCode === "number"
+      ? resultObj.exitCode
+      : typeof resultObj?.code === "number"
+        ? resultObj.code
+        : 0;
   if (stderr.trim()) {
     logWarn(`openclaw ${command} stderr`, stderr.trim());
+  }
+  if (exitCode !== 0) {
+    const combined = `${stdout}\n${stderr}`;
+    if (/pairing required/i.test(combined)) {
+      throw new Error(
+        "Gateway pairing required for config updates. Run `openclaw devices list` and approve the pending operator request.",
+      );
+    }
+    throw new Error(`openclaw gateway call ${command} failed with exit code ${exitCode}`);
   }
   const parsed = parseJsonFromMixedText(stdout);
   const stdoutTrimmed = stdout.trim();
