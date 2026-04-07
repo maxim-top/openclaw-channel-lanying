@@ -1182,6 +1182,7 @@ class ClawchatSession {
   private listenersBound = false;
   private shuttingDown = false;
   private loginSuccessSeen = false;
+  private socketConnectedSeen = false;
   private selfId = "";
   private lastConfig?: ResolvedClawchatAccount;
   private onlineMarkerSent = false;
@@ -1409,6 +1410,7 @@ class ClawchatSession {
       loginMessage: (event: unknown) => logDebug("loginMessage event", event),
       loginFail: (event: unknown) => {
         this.loginSuccessSeen = false;
+        this.socketConnectedSeen = false;
         logWarn("loginFail event", event);
         this.updateRuntimeStatus({
           running: true,
@@ -1423,6 +1425,7 @@ class ClawchatSession {
       },
       flooError: (event: unknown) => {
         logWarn("flooError event", event);
+        this.socketConnectedSeen = false;
         this.updateRuntimeStatus({
           running: true,
           connected: false,
@@ -1432,6 +1435,7 @@ class ClawchatSession {
       },
       fireplaceError: (event: unknown) => {
         logWarn("fireplaceError event", event);
+        this.socketConnectedSeen = false;
         this.updateRuntimeStatus({
           running: true,
           connected: false,
@@ -1442,6 +1446,7 @@ class ClawchatSession {
       },
       reconnect: (event: unknown) => {
         logWarn("reconnect event", event);
+        this.socketConnectedSeen = false;
         this.updateRuntimeStatus({
           running: true,
           connected: false,
@@ -1451,6 +1456,7 @@ class ClawchatSession {
       },
       disconnected: (event: unknown) => {
         logWarn("disconnected", event);
+        this.socketConnectedSeen = false;
         this.updateRuntimeStatus({
           running: true,
           connected: false,
@@ -1459,6 +1465,7 @@ class ClawchatSession {
       },
       connected: (event: unknown) => {
         logDebug("connected", event);
+        this.socketConnectedSeen = true;
         this.updateRuntimeStatus({
           running: true,
           connected: true,
@@ -2068,6 +2075,7 @@ class ClawchatSession {
       this.onlineMarkerSent = false;
       this.offlineMarkerSent = false;
       this.loginSuccessSeen = false;
+      this.socketConnectedSeen = false;
       this.accountKey = nextKey;
       this.lastConfig = account;
       this.bindListeners(account);
@@ -2102,9 +2110,8 @@ class ClawchatSession {
       });
       this.updateRuntimeStatus({
         running: true,
-        connected: true,
+        connected: false,
         reconnectAttempts: 0,
-        lastConnectedAt: Date.now(),
         lastError: null,
       });
 
@@ -2112,15 +2119,20 @@ class ClawchatSession {
       while (Date.now() < deadline) {
         const ready = Boolean(this.client?.isReady?.());
         const loggedIn = Boolean(this.client?.isLogin?.());
-        if (loggedIn) {
+        const connected = this.socketConnectedSeen;
+        if (loggedIn && connected) {
           this.updateSelfIdFromClient("login fully ready");
-          logDebug("sdk ready", { ready, loggedIn });
+          logDebug("sdk ready", { ready, loggedIn, connected });
           this.resetReconnectState("login_success");
           return;
         }
         await sleep(READY_POLL_MS);
       }
-      throw new Error("ClawChat SDK not logged in after login timeout");
+      throw new Error(
+        this.client?.isLogin?.()
+          ? "ClawChat SDK login completed but socket did not reach connected state before timeout"
+          : "ClawChat SDK not logged in after login timeout",
+      );
     })();
 
     try {
@@ -2302,6 +2314,7 @@ class ClawchatSession {
       this.listenersBound = false;
       this.loginPromise = null;
       this.loginSuccessSeen = false;
+      this.socketConnectedSeen = false;
       this.selfId = "";
       this.onlineMarkerSent = false;
       this.updateRuntimeStatus({

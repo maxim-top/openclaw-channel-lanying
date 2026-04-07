@@ -7,8 +7,6 @@
   "devDependencies": {
     "openclaw": "latest"
   },
-  "dependencies": {
-  },
   "main": "./index.ts",
   "openclaw": {
     "extensions": ["./index.ts"]
