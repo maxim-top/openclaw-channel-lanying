@@ -652,7 +652,14 @@ function extractPresetPromptSync(
 function extractRouterSignal(
   eventAny: Record<string, unknown>,
   meta: Record<string, unknown>,
-): { type: "router_request"; message: Record<string, unknown> } | { type: "router_reply" } | null {
+):
+  | {
+      type: "router_request";
+      message: Record<string, unknown>;
+      knowledge: string;
+    }
+  | { type: "router_reply" }
+  | null {
   const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
   const extObjCandidates = [
     parseExtValue(eventAny.ext),
@@ -675,9 +682,12 @@ function extractRouterSignal(
     }
     const message = parseMetaMessage(openclawObj.message);
     if (message) {
+      const knowledge =
+        typeof openclawObj.knowledge === "string" ? openclawObj.knowledge.trim() : "";
       return {
         type: "router_request",
         message,
+        knowledge,
       };
     }
     logWarn("skip router_request: openclaw.message is invalid", {
@@ -1857,6 +1867,7 @@ class ClawchatSession {
   private async handleRouterRequest(
     routerMessage: Record<string, unknown>,
     account: ResolvedClawchatAccount,
+    knowledge = "",
   ): Promise<void> {
     const body = extractText(routerMessage as ClawchatInboundEvent);
     if (!body.trim()) {
@@ -1896,6 +1907,10 @@ class ClawchatSession {
     const routerRelayMark = true;
     const runtime = getClawchatRuntime();
     const cfg = await runtime.config.loadConfig();
+    const bodyWithKnowledge =
+      knowledge.trim().length > 0
+        ? ["[Retrieved knowledge context]", knowledge.trim(), "[End knowledge context]", "", body].join("\n")
+        : body;
     let replySeq = 0;
     let deliveredCount = 0;
     const dispatchTo = chatType === "group" ? groupId : toId || this.selfId;
@@ -1906,7 +1921,7 @@ class ClawchatSession {
 
     const result = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: {
-        Body: body,
+        Body: bodyWithKnowledge,
         From: fromId || toId || this.selfId,
         To: dispatchTo,
         SessionKey: sessionKey,
@@ -2126,8 +2141,9 @@ class ClawchatSession {
             senderId,
             toId: toIdRaw,
             selfId: this.selfId,
+            knowledgeBytes: Buffer.byteLength(routerSignal.knowledge ?? "", "utf8"),
           });
-          await this.handleRouterRequest(routerSignal.message, account);
+          await this.handleRouterRequest(routerSignal.message, account, routerSignal.knowledge);
           return;
         }
         logDebug("skip loopback message (from === to)", {
