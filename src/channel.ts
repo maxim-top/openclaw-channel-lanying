@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -90,6 +90,9 @@ const CONFIG_PATCH_RETRY_MAX = 3;
 const CONFIG_PATCH_DEDUPE_TTL_MS = 60_000;
 const GROUP_CONTEXT_MAX_MESSAGES = 30;
 const GROUP_CONTEXT_MAX_CHARS = 6_000;
+const CLAWCHAT_MANAGED_DIR = "clawchat";
+const CLAWCHAT_MANAGED_AGENTS_PATH = `${CLAWCHAT_MANAGED_DIR}/AGENTS.md`;
+const DEFAULT_AGENT_ID = "main";
 const LOG_MASK = "******";
 const SENSITIVE_KEY_PATTERN =
   "(?:password|pass|pwd|api[_-]?key|token|secret|authorization|auth|cookie|session|private[_-]?key)";
@@ -613,6 +616,35 @@ function parseMetaMessage(value: unknown): Record<string, unknown> | null {
   }
   if (typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, unknown>;
+  }
+  return null;
+}
+
+function extractPresetPromptSync(
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+): { chatbotId: string; chatbotName: string; prompt: string } | null {
+  const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
+  const extObjCandidates = [
+    parseExtValue(eventAny.ext),
+    parseExtValue(meta.ext),
+    parseExtValue(payload?.ext),
+  ].filter(Boolean) as Record<string, unknown>[];
+
+  for (const extObj of extObjCandidates) {
+    const openclaw = extObj.openclaw;
+    if (!openclaw || typeof openclaw !== "object" || Array.isArray(openclaw)) {
+      continue;
+    }
+    const openclawObj = openclaw as Record<string, unknown>;
+    if (String(openclawObj.type ?? "").trim() !== "preset_prompt_sync") {
+      continue;
+    }
+    return {
+      chatbotId: String(openclawObj.chatbotId ?? "").trim(),
+      chatbotName: String(openclawObj.chatbotName ?? "").trim(),
+      prompt: typeof openclawObj.prompt === "string" ? openclawObj.prompt : "",
+    };
   }
   return null;
 }
@@ -1344,6 +1376,215 @@ class ClawchatSession {
     await queued;
   }
 
+  private resolveUserPath(input: string): string {
+    const trimmed = input.trim();
+    if (!trimmed) {
+      return "";
+    }
+    if (trimmed === "~") {
+      return os.homedir();
+    }
+    if (trimmed.startsWith("~/")) {
+      return path.join(os.homedir(), trimmed.slice(2));
+    }
+    return path.resolve(trimmed);
+  }
+
+  private resolveStateDir(): string {
+    const override = process.env.OPENCLAW_STATE_DIR?.trim();
+    if (override) {
+      return this.resolveUserPath(override);
+    }
+    return path.join(os.homedir(), ".openclaw");
+  }
+
+  private resolveDefaultAgentWorkspaceDir(): string {
+    const profile = process.env.OPENCLAW_PROFILE?.trim();
+    if (profile && profile.toLowerCase() !== "default") {
+      return path.join(os.homedir(), ".openclaw", `workspace-${profile}`);
+    }
+    return path.join(os.homedir(), ".openclaw", "workspace");
+  }
+
+  private listAgentEntries(cfg: OpenClawConfig): Array<Record<string, unknown>> {
+    const agents = asPlainObject(cfg?.agents);
+    const list = agents?.list;
+    if (!Array.isArray(list)) {
+      return [];
+    }
+    return list
+      .map((entry) => asPlainObject(entry))
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry));
+  }
+
+  private resolveDefaultAgentId(cfg: OpenClawConfig): string {
+    const agents = this.listAgentEntries(cfg);
+    if (agents.length === 0) {
+      return DEFAULT_AGENT_ID;
+    }
+    const explicitDefault =
+      agents.find((entry) => entry.default === true) ?? agents[0] ?? null;
+    const id = typeof explicitDefault?.id === "string" ? explicitDefault.id.trim() : "";
+    return id || DEFAULT_AGENT_ID;
+  }
+
+  private resolveAgentWorkspaceDir(cfg: OpenClawConfig, agentId: string): string {
+    const normalizedAgentId = agentId.trim() || DEFAULT_AGENT_ID;
+    const agents = asPlainObject(cfg?.agents);
+    const agentEntries = this.listAgentEntries(cfg);
+    const matchingAgent =
+      agentEntries.find((entry) => {
+        const entryId = typeof entry.id === "string" ? entry.id.trim() : "";
+        return entryId === normalizedAgentId;
+      }) ?? null;
+    const explicitWorkspace =
+      typeof matchingAgent?.workspace === "string" ? matchingAgent.workspace.trim() : "";
+    if (explicitWorkspace) {
+      return this.resolveUserPath(explicitWorkspace);
+    }
+    const defaults = asPlainObject(agents?.defaults);
+    const fallbackWorkspace =
+      typeof defaults?.workspace === "string" ? defaults.workspace.trim() : "";
+    const defaultAgentId = this.resolveDefaultAgentId(cfg);
+    if (normalizedAgentId === defaultAgentId) {
+      return fallbackWorkspace
+        ? this.resolveUserPath(fallbackWorkspace)
+        : this.resolveDefaultAgentWorkspaceDir();
+    }
+    if (fallbackWorkspace) {
+      return path.join(this.resolveUserPath(fallbackWorkspace), normalizedAgentId);
+    }
+    return path.join(this.resolveStateDir(), `workspace-${normalizedAgentId}`);
+  }
+
+  private resolveManagedAgentsLocation(cfg: OpenClawConfig): {
+    managedDir: string;
+    managedFile: string;
+    injectionPath: string;
+  } {
+    const defaultAgentId = this.resolveDefaultAgentId(cfg);
+    const workspaceDir = this.resolveAgentWorkspaceDir(cfg, defaultAgentId);
+    return {
+      managedDir: path.join(workspaceDir, CLAWCHAT_MANAGED_DIR),
+      managedFile: path.join(workspaceDir, CLAWCHAT_MANAGED_AGENTS_PATH),
+      injectionPath: CLAWCHAT_MANAGED_AGENTS_PATH,
+    };
+  }
+
+  private buildManagedAgentsContent(params: {
+    chatbotId: string;
+    chatbotName: string;
+    prompt: string;
+  }): string {
+    const title = params.chatbotName || params.chatbotId || "unknown-chatbot";
+    const body =
+      params.prompt.trim().length > 0
+        ? params.prompt
+        : "No synced system preset prompt. Previous synced content has been cleared.";
+    return [
+      "# AGENTS.md",
+      "",
+      "This file is managed by the ClawChat plugin for OpenClaw prompt injection.",
+      "",
+      `Chatbot ID: ${params.chatbotId || "unknown"}`,
+      `Chatbot Name: ${title}`,
+      "",
+      "## Synced System Preset Prompt",
+      "",
+      body,
+      "",
+    ].join("\n");
+  }
+
+  private ensureManagedAgentsFile(params: {
+    cfg: OpenClawConfig;
+    chatbotId: string;
+    chatbotName: string;
+    prompt: string;
+  }): void {
+    const location = this.resolveManagedAgentsLocation(params.cfg);
+    const content = this.buildManagedAgentsContent({
+      chatbotId: params.chatbotId,
+      chatbotName: params.chatbotName,
+      prompt: params.prompt,
+    });
+    mkdirSync(location.managedDir, { recursive: true });
+    writeFileSync(location.managedFile, content, "utf8");
+    logDebug("managed AGENTS.md updated", {
+      chatbotId: params.chatbotId,
+      chatbotName: params.chatbotName,
+      managedFile: location.managedFile,
+      injectionPath: location.injectionPath,
+      promptBytes: Buffer.byteLength(params.prompt, "utf8"),
+    });
+  }
+
+  private async ensureBootstrapExtraFilesConfigured(cfg: OpenClawConfig): Promise<void> {
+    const { injectionPath } = this.resolveManagedAgentsLocation(cfg);
+    const getResult = await runGatewayCall("config.get", {});
+    const root = asPlainObject(getResult);
+    if (!root) {
+      throw new Error("config.get did not return an object");
+    }
+    const hooks = asPlainObject(root.hooks) ?? {};
+    const internal = asPlainObject(hooks.internal) ?? {};
+    const entries = asPlainObject(internal.entries) ?? {};
+    const bootstrapEntry = asPlainObject(entries["bootstrap-extra-files"]) ?? {};
+    const existingPathsRaw =
+      Array.isArray(bootstrapEntry.paths)
+        ? bootstrapEntry.paths
+        : Array.isArray(bootstrapEntry.patterns)
+          ? bootstrapEntry.patterns
+          : Array.isArray(bootstrapEntry.files)
+            ? bootstrapEntry.files
+            : [];
+    const existingPaths = existingPathsRaw
+      .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+      .filter(Boolean);
+    const nextPaths = existingPaths.includes(injectionPath)
+      ? existingPaths
+      : [...existingPaths, injectionPath];
+    const hooksEnabled = internal.enabled === true;
+    const bootstrapEnabled = bootstrapEntry.enabled === true;
+    const alreadyConfigured =
+      hooksEnabled &&
+      bootstrapEnabled &&
+      existingPaths.includes(injectionPath) &&
+      Array.isArray(bootstrapEntry.paths);
+    if (alreadyConfigured) {
+      return;
+    }
+    const rawPatch = JSON.stringify({
+      hooks: {
+        internal: {
+          enabled: true,
+          entries: {
+            "bootstrap-extra-files": {
+              ...bootstrapEntry,
+              enabled: true,
+              paths: nextPaths,
+            },
+          },
+        },
+      },
+    });
+    await this.applyOpenClawConfigPatch(rawPatch);
+    logDebug("bootstrap-extra-files ensured for managed AGENTS.md", {
+      path: injectionPath,
+      pathsCount: nextPaths.length,
+    });
+  }
+
+  private async handlePresetPromptSync(params: {
+    cfg: OpenClawConfig;
+    chatbotId: string;
+    chatbotName: string;
+    prompt: string;
+  }): Promise<void> {
+    this.ensureManagedAgentsFile(params);
+    await this.ensureBootstrapExtraFilesConfigured(params.cfg);
+  }
+
   private currentConfigKey(account: ResolvedClawchatAccount): string {
     return `${account.appId}::${account.username}::${account.password}`;
   }
@@ -1792,12 +2033,21 @@ class ClawchatSession {
       }
       this.updateSelfIdFromClient("inbound event");
       const configPatchRaw = extractConfigPatchRaw(eventAny, meta);
+      const presetPromptSync = extractPresetPromptSync(eventAny, meta);
       const routerSignal = extractRouterSignal(eventAny, meta);
       if (mode === "direct" && senderId && toIdRaw && senderId === toIdRaw) {
         const isSelfLoopback = Boolean(this.selfId && senderId === this.selfId);
         if (isSelfLoopback && account.allowManage && configPatchRaw) {
           try {
+            await this.sendConfigPatchMarkerToSelf({
+              stage: "before",
+              rawPatch: configPatchRaw,
+            });
             await this.applyOpenClawConfigPatch(configPatchRaw);
+            await this.sendConfigPatchMarkerToSelf({
+              stage: "after",
+              rawPatch: configPatchRaw,
+            });
             logDebug("applied config patch from self loopback message", {
               senderId,
               toId: toIdRaw,
@@ -1812,6 +2062,53 @@ class ClawchatSession {
               allowManage: account.allowManage,
               hasConfigPatch: Boolean(configPatchRaw),
               patchBytes: Buffer.byteLength(configPatchRaw, "utf8"),
+            });
+          }
+          return;
+        }
+        if (isSelfLoopback && account.allowManage && presetPromptSync) {
+          if (!isCommandOuterMessage(eventAny, meta)) {
+            logDebug("skip loopback preset_prompt_sync: outer type is not command", {
+              senderId,
+              toId: toIdRaw,
+              selfId: this.selfId,
+            });
+            return;
+          }
+          try {
+            const cfg = await getClawchatRuntime().config.loadConfig();
+            await this.sendPresetPromptSyncMarkerToSelf({
+              stage: "before",
+              chatbotId: presetPromptSync.chatbotId,
+              chatbotName: presetPromptSync.chatbotName,
+              prompt: presetPromptSync.prompt,
+            });
+            await this.handlePresetPromptSync({
+              cfg,
+              chatbotId: presetPromptSync.chatbotId,
+              chatbotName: presetPromptSync.chatbotName,
+              prompt: presetPromptSync.prompt,
+            });
+            await this.sendPresetPromptSyncMarkerToSelf({
+              stage: "after",
+              chatbotId: presetPromptSync.chatbotId,
+              chatbotName: presetPromptSync.chatbotName,
+              prompt: presetPromptSync.prompt,
+            });
+            logDebug("processed preset_prompt_sync from self loopback message", {
+              senderId,
+              toId: toIdRaw,
+              chatbotId: presetPromptSync.chatbotId,
+              promptBytes: Buffer.byteLength(presetPromptSync.prompt, "utf8"),
+            });
+          } catch (err) {
+            logError("failed to process preset_prompt_sync from self loopback message", {
+              err,
+              senderId,
+              toId: toIdRaw,
+              selfId: this.selfId,
+              chatbotId: presetPromptSync.chatbotId,
+              promptBytes: Buffer.byteLength(presetPromptSync.prompt, "utf8"),
             });
           }
           return;
@@ -1847,6 +2144,7 @@ class ClawchatSession {
           selfId: this.selfId,
           allowManage: account.allowManage,
           hasConfigPatch: Boolean(configPatchRaw),
+          hasPresetPromptSync: Boolean(presetPromptSync),
           routerSignalType: routerSignal?.type ?? "",
         });
         return;
@@ -2120,9 +2418,31 @@ class ClawchatSession {
         const ready = Boolean(this.client?.isReady?.());
         const loggedIn = Boolean(this.client?.isLogin?.());
         const connected = this.socketConnectedSeen;
-        if (loggedIn && connected) {
+        const loginSuccess = this.loginSuccessSeen;
+        if (loggedIn && (connected || ready || loginSuccess)) {
+          if (!this.socketConnectedSeen && (ready || loginSuccess)) {
+            this.socketConnectedSeen = true;
+            logDebug("sdk ready without explicit connected event; using fallback readiness", {
+              ready,
+              loggedIn,
+              connected,
+              loginSuccess,
+            });
+          }
           this.updateSelfIdFromClient("login fully ready");
-          logDebug("sdk ready", { ready, loggedIn, connected });
+          logDebug("sdk ready", {
+            ready,
+            loggedIn,
+            connected: this.socketConnectedSeen,
+            loginSuccess,
+          });
+          this.updateRuntimeStatus({
+            running: true,
+            connected: true,
+            reconnectAttempts: 0,
+            lastConnectedAt: Date.now(),
+            lastError: null,
+          });
           this.resetReconnectState("login_success");
           return;
         }
@@ -2230,6 +2550,89 @@ class ClawchatSession {
       logDebug("sent offline marker message to self", { selfId: this.selfId });
     } catch (err) {
       logWarn("failed to send offline marker message to self", { err, selfId: this.selfId });
+    }
+  }
+
+  private async sendPresetPromptSyncMarkerToSelf(params: {
+    stage: "before" | "after";
+    chatbotId: string;
+    chatbotName: string;
+    prompt: string;
+  }): Promise<void> {
+    if (!this.client || !this.selfId) {
+      return;
+    }
+    const chatbotLabel = params.chatbotName || params.chatbotId || "unknown-chatbot";
+    const content =
+      params.stage === "before"
+        ? `ClawChat 插件正在更新系统提示词：${chatbotLabel}`
+        : `ClawChat 插件已更新系统提示词：${chatbotLabel}`;
+    try {
+      await this.client.sysManage.sendRosterMessage({
+        type: "text",
+        uid: this.selfId,
+        content,
+        ext: JSON.stringify({
+          openclaw: {
+            type: "preset_prompt_sync_marker",
+            stage: params.stage,
+            chatbotId: params.chatbotId,
+            chatbotName: params.chatbotName,
+            promptBytes: Buffer.byteLength(params.prompt, "utf8"),
+          },
+        }),
+      });
+      logDebug("sent preset_prompt_sync marker message to self", {
+        stage: params.stage,
+        selfId: this.selfId,
+        chatbotId: params.chatbotId,
+      });
+    } catch (err) {
+      logWarn("failed to send preset_prompt_sync marker message to self", {
+        err,
+        stage: params.stage,
+        selfId: this.selfId,
+        chatbotId: params.chatbotId,
+      });
+    }
+  }
+
+  private async sendConfigPatchMarkerToSelf(params: {
+    stage: "before" | "after";
+    rawPatch: string;
+  }): Promise<void> {
+    if (!this.client || !this.selfId) {
+      return;
+    }
+    const content =
+      params.stage === "before"
+        ? "ClawChat 插件正在更新配置"
+        : "ClawChat 插件已更新配置";
+    try {
+      await this.client.sysManage.sendRosterMessage({
+        type: "text",
+        uid: this.selfId,
+        content,
+        ext: JSON.stringify({
+          openclaw: {
+            type: "config_patch_marker",
+            stage: params.stage,
+            patchBytes: Buffer.byteLength(params.rawPatch, "utf8"),
+          },
+        }),
+      });
+      logDebug("sent config_patch marker message to self", {
+        stage: params.stage,
+        selfId: this.selfId,
+        patchBytes: Buffer.byteLength(params.rawPatch, "utf8"),
+      });
+    } catch (err) {
+      logWarn("failed to send config_patch marker message to self", {
+        err,
+        stage: params.stage,
+        selfId: this.selfId,
+        patchBytes: Buffer.byteLength(params.rawPatch, "utf8"),
+      });
     }
   }
 
