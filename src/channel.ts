@@ -575,6 +575,37 @@ function hasSelfMentionInConfig(
   return false;
 }
 
+function resolveToUserNicknameFromConfig(
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+): string {
+  const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
+  const configCandidates = [
+    parseConfigValue((eventAny as { config?: unknown }).config),
+    parseConfigValue((meta as { config?: unknown }).config),
+    parseConfigValue(payload?.config),
+  ].filter(Boolean) as Record<string, unknown>[];
+
+  for (const config of configCandidates) {
+    const nickname = (config.to_user_nickname ?? config.toUserNickname) as unknown;
+    if (typeof nickname === "string" && nickname.trim()) {
+      return nickname.trim();
+    }
+  }
+  return "";
+}
+
+function removeOpenclawEdgeMention(content: string, toUserNickname: string): string {
+  const nickname = toUserNickname.trim();
+  if (!nickname) {
+    return content;
+  }
+  const escapedNickname = nickname.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const withoutPrefix = content.replace(new RegExp(`^@${escapedNickname}(?:\\u2005| )+`), "");
+  const withoutSuffix = withoutPrefix.replace(new RegExp(`@${escapedNickname}(?:\\u2005| )*$`), "");
+  return withoutSuffix.trim();
+}
+
 function extractConfigPatchRaw(
   eventAny: Record<string, unknown>,
   meta: Record<string, unknown>,
@@ -1907,10 +1938,15 @@ class ClawchatSession {
     const routerRelayMark = true;
     const runtime = getClawchatRuntime();
     const cfg = await runtime.config.loadConfig();
+    const routerMeta = routerMessage as Record<string, unknown>;
+    const toUserNickname = resolveToUserNicknameFromConfig(routerMeta, routerMeta);
+    const cleanedBody = removeOpenclawEdgeMention(body, toUserNickname);
+    const trimmedBody = cleanedBody.trim();
+    const isSlashCommand = trimmedBody.startsWith("/");
     const bodyWithKnowledge =
       knowledge.trim().length > 0
-        ? ["[Retrieved knowledge context]", knowledge.trim(), "[End knowledge context]", "", body].join("\n")
-        : body;
+        ? ["[Retrieved knowledge context]", knowledge.trim(), "[End knowledge context]", "", cleanedBody].join("\n")
+        : cleanedBody;
     let replySeq = 0;
     let deliveredCount = 0;
     const dispatchTo = chatType === "group" ? groupId : toId || this.selfId;
@@ -1922,6 +1958,10 @@ class ClawchatSession {
     const result = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: {
         Body: bodyWithKnowledge,
+        BodyForAgent: bodyWithKnowledge,
+        CommandBody: cleanedBody,
+        BodyForCommands: cleanedBody,
+        CommandAuthorized: isSlashCommand,
         From: fromId || toId || this.selfId,
         To: dispatchTo,
         SessionKey: sessionKey,
@@ -2172,6 +2212,9 @@ class ClawchatSession {
         logDebug("skip empty inbound", { mode, eventType: event.type });
         return;
       }
+      const toUserNickname = resolveToUserNicknameFromConfig(eventAny, meta);
+      const cleanedBody = removeOpenclawEdgeMention(body, toUserNickname);
+      const isSlashCommand = cleanedBody.startsWith("/");
       const timestampNum = Number(
         eventAny.timestamp ?? meta.timestamp ?? (eventAny as { ts?: unknown }).ts ?? Date.now(),
       );
@@ -2209,7 +2252,7 @@ class ClawchatSession {
             groupId,
             senderId,
             senderName: resolveSenderNameFromConfig(eventAny, meta) || undefined,
-            body,
+            body: cleanedBody,
             timestamp: Number.isFinite(timestampNum) ? timestampNum : Date.now(),
           });
           logDebug("skip group inbound: mention required", {
@@ -2230,7 +2273,7 @@ class ClawchatSession {
         senderId,
         toId: toIdRaw,
         targetId,
-        bodyPreview: body.slice(0, 80),
+        bodyPreview: cleanedBody.slice(0, 80),
         keys: Object.keys(meta),
       });
 
@@ -2274,11 +2317,11 @@ class ClawchatSession {
           });
         }
       }
-      let bodyToDispatch = body;
+      let bodyToDispatch = cleanedBody;
       if (mode === "group") {
         const pendingContext = this.consumePendingGroupContext(groupId);
-        if (pendingContext) {
-          bodyToDispatch = `${pendingContext}\n\n[Current message]\n${body}`;
+        if (pendingContext && !isSlashCommand) {
+          bodyToDispatch = `${pendingContext}\n\n[Current message]\n${cleanedBody}`;
           const contextBytes = Buffer.byteLength(pendingContext, "utf8");
           const contextPreview = Buffer.from(pendingContext, "utf8").subarray(0, 4096).toString("utf8");
           logDebug("group pending context attached", {
@@ -2305,6 +2348,9 @@ class ClawchatSession {
       const result = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
         ctx: {
           Body: bodyToDispatch,
+          BodyForCommands: cleanedBody,
+          CommandBody: cleanedBody,
+          CommandAuthorized: isSlashCommand,
           From: senderId || targetId,
           To: dispatchTo,
           SessionKey: sessionKey,
