@@ -729,6 +729,58 @@ function extractRouterSignal(
   return null;
 }
 
+type RouterReplyTargetSnapshot = {
+  requestSid: string;
+  replyKind: "group" | "user";
+  replyId: string;
+};
+
+function resolveRouterReplyTargetSnapshot(
+  routerMessage: Record<string, unknown>,
+): RouterReplyTargetSnapshot | null {
+  const requestSid =
+    pickId(routerMessage.id) || pickId((routerMessage as { message_id?: unknown }).message_id);
+  if (!requestSid) {
+    return null;
+  }
+  const fromId =
+    pickId(routerMessage.from) ||
+    pickId((routerMessage as { sender_id?: unknown }).sender_id) ||
+    "";
+  const toId =
+    pickId(routerMessage.to) ||
+    pickId((routerMessage as { uid?: unknown }).uid) ||
+    "";
+  const toType = String(
+    (routerMessage as { toType?: unknown }).toType ??
+      (routerMessage as { to_type?: unknown }).to_type ??
+      "",
+  )
+    .trim()
+    .toLowerCase();
+  const explicitGroupId =
+    pickId((routerMessage as { gid?: unknown }).gid) ||
+    pickId((routerMessage as { group_id?: unknown }).group_id) ||
+    pickId((routerMessage as { conversation_id?: unknown }).conversation_id) ||
+    "";
+  const replyGroupId = explicitGroupId || (toType === "group" ? toId : "");
+  if (replyGroupId) {
+    return {
+      requestSid,
+      replyKind: "group",
+      replyId: replyGroupId,
+    };
+  }
+  if (!fromId) {
+    return null;
+  }
+  return {
+    requestSid,
+    replyKind: "user",
+    replyId: fromId,
+  };
+}
+
 function isCommandOuterMessage(
   eventAny: Record<string, unknown>,
   meta: Record<string, unknown>,
@@ -1270,6 +1322,7 @@ class ClawchatSession {
     string,
     Array<{ senderId: string; senderName?: string; body: string; timestamp: number }>
   >();
+  private routerGroupQueueByGroupId = new Map<string, { tail: Promise<void>; pending: number }>();
 
   private appendPendingGroupContext(params: {
     groupId: string;
@@ -1307,6 +1360,56 @@ class ClawchatSession {
       return `[${speaker}] ${item.body}`;
     });
     return `[Group context messages since last trigger]\n${lines.join("\n")}`;
+  }
+
+  private async runRouterRequestInGroupQueue(params: {
+    groupId: string;
+    requestSid: string;
+    run: () => Promise<void>;
+  }): Promise<void> {
+    const groupId = params.groupId.trim();
+    if (!groupId) {
+      await params.run();
+      return;
+    }
+    let queueEntry = this.routerGroupQueueByGroupId.get(groupId);
+    if (!queueEntry) {
+      queueEntry = {
+        tail: Promise.resolve(),
+        pending: 0,
+      };
+      this.routerGroupQueueByGroupId.set(groupId, queueEntry);
+    }
+    queueEntry.pending += 1;
+    logDebug("router_request group queue enqueue", {
+      groupId,
+      requestSid: params.requestSid || undefined,
+      queueLength: queueEntry.pending,
+    });
+    const runQueued = async () => {
+      logDebug("router_request group queue start", {
+        groupId,
+        requestSid: params.requestSid || undefined,
+        queueLength: queueEntry.pending,
+      });
+      try {
+        await params.run();
+      } finally {
+        queueEntry.pending = Math.max(0, queueEntry.pending - 1);
+        const queueLength = queueEntry.pending;
+        if (queueLength === 0 && this.routerGroupQueueByGroupId.get(groupId) === queueEntry) {
+          this.routerGroupQueueByGroupId.delete(groupId);
+        }
+        logDebug("router_request group queue dequeue", {
+          groupId,
+          requestSid: params.requestSid || undefined,
+          queueLength,
+        });
+      }
+    };
+    const queued = queueEntry.tail.then(runQueued, runQueued);
+    queueEntry.tail = queued.catch(() => undefined);
+    await queued;
   }
 
   bindRuntimeStatus(params: {
@@ -1899,7 +2002,14 @@ class ClawchatSession {
     routerMessage: Record<string, unknown>,
     account: ResolvedClawchatAccount,
     knowledge = "",
+    replyTargetSnapshot?: RouterReplyTargetSnapshot,
   ): Promise<void> {
+    if (!replyTargetSnapshot) {
+      logError("skip router_request: reply target snapshot missing", {
+        keys: Object.keys(routerMessage),
+      });
+      return;
+    }
     const body = extractText(routerMessage as ClawchatInboundEvent);
     if (!body.trim()) {
       logWarn("skip router_request: message.content is empty", {
@@ -1917,19 +2027,6 @@ class ClawchatSession {
       this.selfId;
     const messageSid =
       pickId(routerMessage.id) || pickId((routerMessage as { message_id?: unknown }).message_id);
-    const toType = String(
-      (routerMessage as { toType?: unknown }).toType ??
-        (routerMessage as { to_type?: unknown }).to_type ??
-        "",
-    )
-      .trim()
-      .toLowerCase();
-    const groupId =
-      pickId((routerMessage as { gid?: unknown }).gid) ||
-      pickId((routerMessage as { group_id?: unknown }).group_id) ||
-      pickId((routerMessage as { conversation_id?: unknown }).conversation_id) ||
-      (toType === "group" ? toId : "");
-    const chatType: "direct" | "group" = groupId ? "group" : "direct";
     const timestampNum = Number(
       (routerMessage as { timestamp?: unknown }).timestamp ??
         (routerMessage as { ts?: unknown }).ts ??
@@ -1949,11 +2046,22 @@ class ClawchatSession {
         : cleanedBody;
     let replySeq = 0;
     let deliveredCount = 0;
-    const dispatchTo = chatType === "group" ? groupId : toId || this.selfId;
+    const replyFrom = this.selfId || toId || fromId;
+    const replyTo = replyTargetSnapshot.replyId;
+    const replyToType = replyTargetSnapshot.replyKind === "group" ? "group" : "roster";
+    const dispatchTo = replyTargetSnapshot.replyKind === "group" ? replyTo : toId || this.selfId;
     const sessionKey =
-      chatType === "group"
-        ? `router:group:${groupId}`
+      replyTargetSnapshot.replyKind === "group"
+        ? `router:group:${replyTo}`
         : `router:direct:${fromId || toId || this.selfId || CLAWCHAT_CHANNEL_ID}`;
+    logDebug("router_request target resolved", {
+      requestSid: replyTargetSnapshot.requestSid,
+      replyKind: replyTargetSnapshot.replyKind,
+      replyId: replyTo,
+      resolvedBy: "snapshot",
+      fromId: fromId || undefined,
+      toId: toId || undefined,
+    });
 
     const result = await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
       ctx: {
@@ -1970,8 +2078,8 @@ class ClawchatSession {
         MessageSid: messageSid || undefined,
         Timestamp: Number.isFinite(timestampNum) ? timestampNum : Date.now(),
         OriginatingChannel: CLAWCHAT_CHANNEL_ID as any,
-        OriginatingTo: chatType === "group" ? groupId : toId || this.selfId,
-        ChatType: chatType,
+        OriginatingTo: replyTo,
+        ChatType: replyTargetSnapshot.replyKind === "group" ? "group" : "direct",
         Provider: CLAWCHAT_CHANNEL_ID,
         Surface: CLAWCHAT_CHANNEL_ID,
         SenderId: fromId || undefined,
@@ -1988,8 +2096,8 @@ class ClawchatSession {
           const now = Date.now();
           const replyMessage: Record<string, unknown> = {
             id: `router_reply_${now}_${replySeq}`,
-            from: this.selfId || toId || fromId,
-            to: chatType === "group" ? groupId : fromId || this.selfId,
+            from: replyFrom,
+            to: replyTo,
             content: response,
             type: "text",
             ext: "",
@@ -1997,7 +2105,7 @@ class ClawchatSession {
             attach: "",
             status: 1,
             timestamp: String(now),
-            toType: chatType === "group" ? "group" : "roster",
+            toType: replyToType,
           };
           await this.sendRouterReplyToSelf(replyMessage);
           deliveredCount += 1;
@@ -2024,7 +2132,7 @@ class ClawchatSession {
       return;
     }
     logDebug("router_reply stream sent for router_request", {
-      requestSid: messageSid || undefined,
+      requestSid: replyTargetSnapshot.requestSid,
       requestFrom: fromId || undefined,
       replyTo: this.selfId,
       deliveredCount,
@@ -2183,7 +2291,34 @@ class ClawchatSession {
             selfId: this.selfId,
             knowledgeBytes: Buffer.byteLength(routerSignal.knowledge ?? "", "utf8"),
           });
-          await this.handleRouterRequest(routerSignal.message, account, routerSignal.knowledge);
+          const replyTargetSnapshot = resolveRouterReplyTargetSnapshot(routerSignal.message);
+          if (!replyTargetSnapshot) {
+            logError("skip router_request: failed to resolve reply target snapshot", {
+              outerEventId: pickId(eventAny.id ?? meta.id) || undefined,
+              routerMessageKeys: Object.keys(routerSignal.message),
+            });
+            return;
+          }
+          if (replyTargetSnapshot.replyKind === "group") {
+            await this.runRouterRequestInGroupQueue({
+              groupId: replyTargetSnapshot.replyId,
+              requestSid: replyTargetSnapshot.requestSid,
+              run: () =>
+                this.handleRouterRequest(
+                  routerSignal.message,
+                  account,
+                  routerSignal.knowledge,
+                  replyTargetSnapshot,
+                ),
+            });
+            return;
+          }
+          await this.handleRouterRequest(
+            routerSignal.message,
+            account,
+            routerSignal.knowledge,
+            replyTargetSnapshot,
+          );
           return;
         }
         logDebug("skip loopback message (from === to)", {
@@ -2774,6 +2909,7 @@ class ClawchatSession {
       this.socketConnectedSeen = false;
       this.selfId = "";
       this.onlineMarkerSent = false;
+      this.routerGroupQueueByGroupId.clear();
       this.updateRuntimeStatus({
         running: false,
         connected: false,
