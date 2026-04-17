@@ -13,7 +13,6 @@ import {
 } from "./channel/config.js";
 import {
   collectHashCandidates,
-  isHistoryEvent,
   type RouterReplyTargetSnapshot,
 } from "./channel/message.js";
 import { createClawchatSessionMessageFlow } from "./channel/session-message-flow.js";
@@ -734,11 +733,7 @@ class ClawchatSession {
     this.listenersBound = true;
     logDebug("binding inbound listeners");
     const onDirect = (name: string, event: unknown) => {
-      const eventAny = (event ?? {}) as Record<string, unknown>;
-      const meta = (eventAny.meta ?? eventAny) as Record<string, unknown>;
-      if (!isHistoryEvent(eventAny, meta)) {
-        logDebug(`inbound event: ${name}`, event);
-      }
+      logDebug(`inbound event: ${name}`, event);
       void this.onInbound(event as ClawchatInboundEvent, "direct", account, name);
     };
     const onGroup = (name: string, event: unknown) => {
@@ -759,7 +754,8 @@ class ClawchatSession {
       onGroupMessageReplace: (event: unknown) => onGroup("onGroupMessageReplace", event),
       onMentionMessage: (event: unknown) => logDebug("onMentionMessage event ignored", event),
       onReceiveHistoryMsg: (event: unknown) => logDebug("onReceiveHistoryMsg event", event),
-      onMessageStatusChanged: (event: unknown) => logDebug("onMessageStatusChanged event", event),
+      onMessageStatusChanged: (event: unknown) =>
+        logDebug("onMessageStatusChanged event", event),
       onSendingMessageStatusChanged: (event: unknown) => {
         logDebug("onSendingMessageStatusChanged event", event);
         this.updateSelfIdFromClient("sending status event");
@@ -986,6 +982,53 @@ class ClawchatSession {
         },
       }),
     });
+  }
+
+  async sendSessionMessageSyncToSelf(update: {
+    sessionFile: string;
+    sessionKey?: string;
+    message?: unknown;
+    messageId?: string;
+  }): Promise<void> {
+    if (!this.client || !this.selfId || !this.client.isLogin?.()) {
+      return;
+    }
+    const message = asPlainObject(update.message);
+    const role =
+      typeof message?.role === "string" && message.role.trim() ? message.role.trim() : undefined;
+    const content =
+      message && Object.prototype.hasOwnProperty.call(message, "content")
+        ? message.content
+        : update.message;
+    const normalizedPayload = {
+      session:
+        (typeof update.sessionKey === "string" && update.sessionKey.trim()) ||
+        String(update.sessionFile ?? ""),
+      message: message
+        ? {
+            role,
+            content,
+          }
+        : {
+            role: undefined,
+          content,
+        },
+    };
+    try {
+      await this.client.sysManage.sendRosterMessage({
+        type: "command",
+        uid: this.selfId,
+        content: "",
+        ext: JSON.stringify({
+          openclaw: {
+            type: "session_message_sync",
+            ...normalizedPayload,
+          },
+        }),
+      });
+    } catch (_err) {
+      // Never let transcript sync forwarding affect the IM session runtime.
+    }
   }
 
   private async handleRouterRequest(
@@ -1415,6 +1458,15 @@ class ClawchatSession {
 }
 
 const session = new ClawchatSession();
+
+export async function emitSessionMessageSyncToSelf(update: {
+  sessionFile: string;
+  sessionKey?: string;
+  message?: unknown;
+  messageId?: string;
+}): Promise<void> {
+  await session.sendSessionMessageSyncToSelf(update);
+}
 
 // OpenClaw channel plugin export.
 export const clawchatPlugin: any = {

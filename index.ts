@@ -1,4 +1,4 @@
-import { clawchatPlugin } from "./src/channel.js";
+import { clawchatPlugin, emitSessionMessageSyncToSelf } from "./src/channel.js";
 import {
   formatGlobalOpenClawSessionLoggerStatus,
   installGlobalOpenClawSessionLogger,
@@ -29,7 +29,16 @@ const plugin = {
   },
   register(api: OpenClawPluginApi) {
     setClawchatRuntime(api.runtime);
-    installGlobalOpenClawSessionLogger(api.runtime);
+    const disposeSessionLogger = installGlobalOpenClawSessionLogger(api.runtime, {
+      onSessionTranscriptUpdate: async (update) => {
+        try {
+          await emitSessionMessageSyncToSelf(update);
+        } catch {
+          // sendSessionMessageSyncToSelf already logs failures; never surface
+          // transcript sync forwarding as an unhandled plugin rejection.
+        }
+      },
+    });
     api.registerCommand?.({
       name: "clawchat-session-log-status",
       description: "Show ClawChat runtime session logger counters and recent events.",
@@ -43,6 +52,11 @@ const plugin = {
       handler: async () => ({ text: resetGlobalOpenClawSessionLoggerStatus() }),
     });
     api.registerChannel({ plugin: clawchatPlugin });
+    return {
+      dispose() {
+        disposeSessionLogger();
+      },
+    };
   },
 };
 
