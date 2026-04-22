@@ -225,6 +225,14 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
     });
   }
 
+  function resolveDirectRouterChatbotId(params: {
+    toId?: string;
+    fromId?: string;
+    selfId?: string;
+  }): string {
+    return params.toId || params.fromId || params.selfId || "";
+  }
+
   function buildMetadataSafeSessionCtx(
     sessionCtx: Record<string, unknown>,
     shouldSanitize: boolean,
@@ -711,8 +719,13 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       (replyTargetSnapshot.replyKind === "group" || routerToType === "group" || Boolean(routerGroupId))
         ? "group"
         : "direct";
+    const directChatbotId = resolveDirectRouterChatbotId({
+      toId: toId || undefined,
+      fromId: fromId || undefined,
+      selfId: selfId || undefined,
+    });
     const inboundPeerId =
-      inboundMode === "group" ? routerGroupId || replyTo || toId || selfId : fromId || toId || selfId;
+      inboundMode === "group" ? routerGroupId || replyTo || toId || selfId : directChatbotId;
     if (!inboundPeerId) {
       logError("skip router_request: failed to resolve inbound peer id", {
         requestSid: replyTargetSnapshot.requestSid,
@@ -739,9 +752,10 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
         : bodyToDispatch;
     let replySeq = 0;
     let deliveredCount = 0;
-    const replyFrom = selfId || toId || fromId;
+    const replyFrom =
+      replyTargetSnapshot.replyKind === "group" ? selfId || toId || fromId : directChatbotId;
     const replyToType = replyTargetSnapshot.replyKind === "group" ? "group" : "roster";
-    const dispatchTo = replyTargetSnapshot.replyKind === "group" ? replyTo : toId || selfId;
+    const dispatchTo = replyTargetSnapshot.replyKind === "group" ? replyTo : directChatbotId;
     const route = ctx.resolveAgentRoute({
       cfg,
       channel: CLAWCHAT_ROUTER_CHANNEL_ID,
@@ -770,7 +784,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
     const conversationLabel =
       inboundMode === "group"
         ? routerGroupId || replyTo || toId || selfId
-        : fromId || inboundPeerId;
+        : directChatbotId || inboundPeerId;
     const envelopeBody = ctx.formatAgentEnvelope({
       channel: "ClawChat",
       from: conversationLabel,
@@ -786,7 +800,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       CommandBody: cleanedBody,
       BodyForCommands: cleanedBody,
       CommandAuthorized: isSlashCommand,
-      From: fromId || toId || selfId,
+      From: inboundMode === "group" ? fromId || toId || selfId : directChatbotId,
       To: dispatchTo,
       SessionKey: mappedSessionKey || route.sessionKey,
       RouterRelay: routerRelayMark,
@@ -894,7 +908,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
 
     await maybeSeedParentSessionMapping({
       sessionKey: route.sessionKey,
-      senderUserId: fromId || undefined,
+      senderUserId: inboundMode === "group" ? fromId || undefined : directChatbotId || undefined,
       mappedSessionKey,
     });
 
