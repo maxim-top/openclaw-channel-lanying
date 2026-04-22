@@ -1,3 +1,4 @@
+import { logDebug } from "../shared/logging.js";
 import { asPlainObject, pickId } from "../shared/utils.js";
 
 const GLOBAL_SESSION_LOGGER_INSTALLED = "__clawchatSessionLoggerInstalled";
@@ -165,7 +166,39 @@ function messageLooksLikeClawchatInbound(message: Record<string, unknown> | null
   return sourceTool.includes("clawchat") || sourceTool.includes("lanying");
 }
 
+function isSubagentBootstrapUserTurn(
+  sessionIdentity: string,
+  message: Record<string, unknown> | null,
+): boolean {
+  if (!message || !sessionIdentity.includes(":subagent:")) {
+    return false;
+  }
+  const visibleText = extractMessageVisibleText(message.content);
+  if (!visibleText) {
+    return false;
+  }
+  const normalizedText = visibleText.trim();
+  return (
+    normalizedText.includes("[Subagent Task]:") ||
+    normalizedText.startsWith("[Subagent Context] You are running as a subagent")
+  );
+}
+
+function shouldLogSubagentBootstrapTranscriptUpdate(update: SessionTranscriptUpdate): boolean {
+  const sessionIdentity = resolveSessionIdentity(update);
+  if (!sessionIdentity.includes(":subagent:")) {
+    return false;
+  }
+  const message = asPlainObject(update.message);
+  const role = normalizeHint(message?.role ?? message?.authorRole);
+  if (role !== "user") {
+    return false;
+  }
+  return isSubagentBootstrapUserTurn(sessionIdentity, message);
+}
+
 function resolveUserMessageSyncSource(
+  sessionIdentity: string,
   message: Record<string, unknown> | null,
 ): SessionMessageSyncSource | null {
   if (!message || isOpenClawGeneratedMirror(message)) {
@@ -178,6 +211,9 @@ function resolveUserMessageSyncSource(
   const sourceChannel = normalizeHint(provenance?.sourceChannel);
   const sourceTool = normalizeHint(provenance?.sourceTool);
   if (sourceChannel || sourceTool) {
+    if (isSubagentBootstrapUserTurn(sessionIdentity, message)) {
+      return "control_ui_user";
+    }
     return sourceChannel === "webchat" ? "control_ui_user" : null;
   }
   return "control_ui_user";
@@ -304,6 +340,9 @@ function shouldSuppressDuplicatedControlUiUser(update: SessionTranscriptUpdate):
     return false;
   }
   const message = asPlainObject(update.message);
+  if (isSubagentBootstrapUserTurn(sessionIdentity, message)) {
+    return false;
+  }
   const rawVisibleText = extractMessageVisibleText(message?.content);
   const strippedVisibleText = normalizeVisibleUserText(rawVisibleText);
   if (!strippedVisibleText) {
@@ -348,7 +387,7 @@ function resolveUpdateSyncSource(update: SessionTranscriptUpdate): SessionMessag
   }
   const role = normalizeHint(message?.role ?? message?.authorRole);
   if (role === "user") {
-    const source = resolveUserMessageSyncSource(message);
+    const source = resolveUserMessageSyncSource(sessionIdentity, message);
     rememberSessionSource(
       sessionIdentity,
       source === "control_ui_user" ? "control_ui" : source === "im_inbound_user" ? "im_inbound" : null,
@@ -500,6 +539,16 @@ export function installGlobalOpenClawSessionLogger(
       listener: (update: SessionTranscriptUpdate) => void,
     ) => () => void
   )((update) => {
+    if (shouldLogSubagentBootstrapTranscriptUpdate(update)) {
+      const sessionIdentity = resolveSessionIdentity(update);
+      const message = asPlainObject(update.message);
+      logDebug("subagent bootstrap transcript update observed", {
+        session: sessionIdentity,
+        messageId: update.messageId,
+        role: normalizeHint(message?.role ?? message?.authorRole) || undefined,
+        bodyPreview: extractBodyPreview(update.message) || undefined,
+      });
+    }
     const source = resolveUpdateSyncSource(update);
     if (!shouldProcessUpdate(update)) {
       return;

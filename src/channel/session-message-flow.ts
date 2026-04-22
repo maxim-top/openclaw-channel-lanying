@@ -136,6 +136,13 @@ type MessageFlowContext = {
     text: string,
     account?: ResolvedClawchatAccount,
   ) => Promise<unknown>;
+  sendSessionMessageSyncToSelf: (update: {
+    sessionFile: string;
+    sessionKey?: string;
+    source?: string;
+    senderUserId?: string;
+    message?: unknown;
+  }) => Promise<void>;
   resolveSessionMapping: (params: {
     appId: string;
     openclawUserId: string;
@@ -186,6 +193,38 @@ function hasMentionHint(
 }
 
 export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
+  function shouldSeedParentSessionMapping(sessionKey: string, mappedSessionKey?: string | null): boolean {
+    const normalized = sessionKey.trim().toLowerCase();
+    if (!normalized || (mappedSessionKey && mappedSessionKey.trim())) {
+      return false;
+    }
+    return (
+      normalized.includes(":clawchat:group:") ||
+      normalized.includes(":clawchat-router:group:")
+    );
+  }
+
+  async function maybeSeedParentSessionMapping(params: {
+    sessionKey: string;
+    senderUserId?: string;
+    mappedSessionKey?: string | null;
+  }): Promise<void> {
+    const senderUserId = params.senderUserId?.trim() || "";
+    if (!shouldSeedParentSessionMapping(params.sessionKey, params.mappedSessionKey) || !senderUserId) {
+      return;
+    }
+    await ctx.sendSessionMessageSyncToSelf({
+      sessionFile: params.sessionKey,
+      sessionKey: params.sessionKey,
+      source: "control_ui_user",
+      senderUserId,
+      message: {
+        role: "user",
+        content: "",
+      },
+    });
+  }
+
   function buildMetadataSafeSessionCtx(
     sessionCtx: Record<string, unknown>,
     shouldSanitize: boolean,
@@ -415,6 +454,12 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
           messageId: params.messageId || undefined,
         });
       },
+    });
+
+    await maybeSeedParentSessionMapping({
+      sessionKey: route.sessionKey,
+      senderUserId: params.senderId,
+      mappedSessionKey,
     });
 
     return await ctx.dispatchReplyWithBufferedBlockDispatcher({
@@ -845,6 +890,12 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       routeSessionKey: persistedSessionKey,
       updateLastRouteSessionKey,
       messageId: messageSid || undefined,
+    });
+
+    await maybeSeedParentSessionMapping({
+      sessionKey: route.sessionKey,
+      senderUserId: fromId || undefined,
+      mappedSessionKey,
     });
 
     const result = await ctx.dispatchReplyWithBufferedBlockDispatcher({

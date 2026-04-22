@@ -376,6 +376,7 @@ class ClawchatSession {
     applyOpenClawConfigPatch: (rawPatch) => this.applyOpenClawConfigPatch(rawPatch),
     handlePresetPromptSync: (params) => this.handlePresetPromptSync(params),
     sendText: (target, text, account) => this.sendText(target, text, account),
+    sendSessionMessageSyncToSelf: (update) => this.sendSessionMessageSyncToSelf(update),
     resolveSessionMapping: (params) => this.resolveSessionMapping(params),
     applySessionMappingSignal: (signal) => this.applySessionMappingSignal(signal),
     pendingGroupContext: this.pendingGroupContext,
@@ -1277,6 +1278,7 @@ class ClawchatSession {
     parentSessionKey?: string;
     rootSessionKey?: string;
     spawnDepth?: number;
+    senderUserId?: string;
   }): Promise<void> {
     if (!this.client || !this.selfId || !this.client.isLogin?.()) {
       return;
@@ -1326,6 +1328,9 @@ class ClawchatSession {
           : {}),
       ...(typeof update.source === "string" && update.source.trim()
         ? { source: update.source.trim() }
+        : {}),
+      ...(typeof update.senderUserId === "string" && update.senderUserId.trim()
+        ? { sender_user_id: update.senderUserId.trim() }
         : {}),
       message: message
         ? {
@@ -1788,6 +1793,7 @@ export async function emitSessionMessageSyncToSelf(update: {
   message?: unknown;
   messageId?: string;
   source?: string;
+  senderUserId?: string;
 }): Promise<void> {
   await session.sendSessionMessageSyncToSelf(update);
 }
