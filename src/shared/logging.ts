@@ -4,6 +4,16 @@ const LOG_MASK = "******";
 const SENSITIVE_KEY_PATTERN =
   "(?:password|pass|pwd|api[_-]?key|token|secret|authorization|auth|cookie|session|private[_-]?key)";
 const SENSITIVE_KEY_RE = new RegExp(SENSITIVE_KEY_PATTERN, "i");
+const SESSION_KEY_ALLOWLIST = new Set([
+  "session",
+  "sessionkey",
+  "sessioncount",
+  "parentsession",
+  "rootsession",
+  "parentsessionkey",
+  "rootsessionkey",
+  "effectivetargetsessionkey",
+]);
 const SENSITIVE_INLINE_RE = new RegExp(
   `((?:${SENSITIVE_KEY_PATTERN})\\s*[:=]\\s*["']?)([^"',\\s}]+)(["']?)`,
   "gi",
@@ -14,6 +24,24 @@ const SENSITIVE_ESCAPED_JSON_RE = new RegExp(
 );
 
 let consoleRedactionInstalled = false;
+
+function normalizeLogKey(value: string): string {
+  return String(value || "")
+    .trim()
+    .replace(/[^a-z0-9]+/gi, "")
+    .toLowerCase();
+}
+
+function shouldRedactKey(value: string): boolean {
+  const normalized = normalizeLogKey(value);
+  if (!normalized) {
+    return false;
+  }
+  if (SESSION_KEY_ALLOWLIST.has(normalized)) {
+    return false;
+  }
+  return SENSITIVE_KEY_RE.test(value);
+}
 
 export function maskText(value: string): string {
   if (!value) {
@@ -56,13 +84,13 @@ export function redactForLog(value: unknown, parentKey = "", depth = 0): unknown
     };
   }
   if (typeof value === "string") {
-    if (SENSITIVE_KEY_RE.test(parentKey)) {
+    if (shouldRedactKey(parentKey)) {
       return maskText(value);
     }
     return redactString(value);
   }
   if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
-    if (SENSITIVE_KEY_RE.test(parentKey)) {
+    if (shouldRedactKey(parentKey)) {
       return LOG_MASK;
     }
     return value;
@@ -73,7 +101,7 @@ export function redactForLog(value: unknown, parentKey = "", depth = 0): unknown
   if (typeof value === "object") {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (SENSITIVE_KEY_RE.test(k)) {
+      if (shouldRedactKey(k)) {
         out[k] = LOG_MASK;
         continue;
       }

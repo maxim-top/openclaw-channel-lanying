@@ -31,8 +31,11 @@ export type RouterReplyTargetSnapshot = {
 
 export type SessionMappingPayload = {
   session: string;
-  groupId: string;
+  groupId?: string;
   openclawUserId?: string;
+  parentSessionKey?: string;
+  rootSessionKey?: string;
+  effectiveTargetSessionKey?: string;
   updatedAt?: number;
 };
 
@@ -195,14 +198,21 @@ function normalizeSessionMappingPayload(value: unknown): SessionMappingPayload |
   const obj = value as Record<string, unknown>;
   const session = String(obj.session ?? obj.sessionKey ?? obj.session_key ?? "").trim();
   const groupId = String(obj.group_id ?? obj.groupId ?? "").trim();
-  if (!session || !groupId) {
+  if (!session) {
     return null;
   }
   const updatedAtRaw = Number(obj.updated_at ?? obj.updatedAt ?? 0);
   return {
     session,
-    groupId,
+    ...(groupId ? { groupId } : {}),
     openclawUserId: String(obj.openclaw_user_id ?? obj.openclawUserId ?? "").trim() || undefined,
+    parentSessionKey:
+      String(obj.parent_session_key ?? obj.parentSessionKey ?? "").trim() || undefined,
+    rootSessionKey: String(obj.root_session_key ?? obj.rootSessionKey ?? "").trim() || undefined,
+    effectiveTargetSessionKey:
+      String(
+        obj.effective_target_session_key ?? obj.effectiveTargetSessionKey ?? "",
+      ).trim() || undefined,
     updatedAt: Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? updatedAtRaw : undefined,
   };
 }

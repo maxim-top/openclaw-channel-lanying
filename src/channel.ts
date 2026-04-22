@@ -345,7 +345,16 @@ class ClawchatSession {
   >();
   private routerGroupQueueByGroupId = new Map<string, { tail: Promise<void>; pending: number }>();
   private sessionMappingByGroupKey = new Map<string, { sessionKey: string; updatedAt: number }>();
-  private sessionMappingBySessionKey = new Map<string, { groupKey: string; updatedAt: number }>();
+  private sessionMappingBySessionKey = new Map<
+    string,
+    {
+      groupKey?: string;
+      updatedAt: number;
+      parentSessionKey?: string;
+      rootSessionKey?: string;
+      effectiveTargetSessionKey?: string;
+    }
+  >();
   private missingSessionMappingSeedPromise: Promise<void> | null = null;
   private readonly messageFlow = createClawchatSessionMessageFlow({
     getSelfId: () => this.selfId,
@@ -384,6 +393,100 @@ class ClawchatSession {
     return sessionKey.trim().toLowerCase();
   }
 
+  private normalizeOptionalSessionKey(value: unknown): string | undefined {
+    const normalized = this.normalizeSessionMappingSessionKey(String(value ?? ""));
+    return normalized || undefined;
+  }
+
+  private buildLocalSessionStorePath(cfg: OpenClawConfig): string {
+    return getClawchatRuntime().channel.session.resolveStorePath(cfg.session?.store, {
+      agentId: DEFAULT_AGENT_ID,
+    });
+  }
+
+  private async loadLocalSessionStore(): Promise<Record<string, unknown>> {
+    const cfg = (await getClawchatRuntime().config.loadConfig()) as OpenClawConfig;
+    const storePath = this.buildLocalSessionStorePath(cfg);
+    try {
+      const raw = fs.readFileSync(storePath, "utf8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+      return parsed;
+    } catch (err) {
+      logWarn("failed to load local session store", {
+        err,
+        storePath,
+      });
+      return {};
+    }
+  }
+
+  private findLocalSessionEntry(
+    sessions: Record<string, unknown>,
+    normalizedSessionKey: string,
+  ): Record<string, unknown> | null {
+    const matchedKey = Object.keys(sessions).find(
+      (key) => this.normalizeSessionMappingSessionKey(key) === normalizedSessionKey,
+    );
+    return asPlainObject(matchedKey ? sessions[matchedKey] : null);
+  }
+
+  private resolveLocalParentSessionKey(entry: Record<string, unknown> | null): string | undefined {
+    if (!entry) {
+      return undefined;
+    }
+    return (
+      this.normalizeOptionalSessionKey(entry.parentSessionKey) ??
+      this.normalizeOptionalSessionKey(entry.spawnedBy)
+    );
+  }
+
+  private resolveLocalRootSessionKey(
+    sessionKey: string,
+    sessions: Record<string, unknown>,
+  ): string | undefined {
+    const normalizedSessionKey = this.normalizeSessionMappingSessionKey(sessionKey);
+    if (!normalizedSessionKey) {
+      return undefined;
+    }
+    let current = normalizedSessionKey;
+    const seen = new Set<string>();
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const entry = this.findLocalSessionEntry(sessions, current);
+      const parent = this.resolveLocalParentSessionKey(entry);
+      if (!parent) {
+        return current;
+      }
+      current = parent;
+    }
+    return normalizedSessionKey;
+  }
+
+  private async resolveLocalSessionLineage(sessionKey: string): Promise<{
+    parentSessionKey?: string;
+    rootSessionKey?: string;
+    spawnDepth?: number;
+  }> {
+    const normalizedSessionKey = this.normalizeSessionMappingSessionKey(sessionKey);
+    if (!normalizedSessionKey) {
+      return {};
+    }
+    const sessions = await this.loadLocalSessionStore();
+    const entry = this.findLocalSessionEntry(sessions, normalizedSessionKey);
+    const parentSessionKey = this.resolveLocalParentSessionKey(entry);
+    const rootSessionKey = this.resolveLocalRootSessionKey(normalizedSessionKey, sessions);
+    const spawnDepthRaw =
+      typeof entry?.spawnDepth === "number" ? entry.spawnDepth : Number(entry?.spawnDepth ?? NaN);
+    return {
+      ...(parentSessionKey ? { parentSessionKey } : {}),
+      ...(rootSessionKey ? { rootSessionKey } : {}),
+      ...(Number.isFinite(spawnDepthRaw) && spawnDepthRaw >= 0 ? { spawnDepth: spawnDepthRaw } : {}),
+    };
+  }
+
   private resolveSessionMapping(params: {
     appId: string;
     openclawUserId: string;
@@ -402,23 +505,35 @@ class ClawchatSession {
     const scopedOpenclawUserId = signal.openclawUserId?.trim() || this.selfId.trim();
     for (const mapping of signal.mappings) {
       const openclawUserId = mapping.openclawUserId?.trim() || scopedOpenclawUserId;
-      const groupId = mapping.groupId.trim();
       const sessionKey = mapping.session.trim();
-      if (!openclawUserId || !groupId || !sessionKey) {
+      const groupId = mapping.groupId?.trim() || "";
+      if (!openclawUserId || !sessionKey) {
         continue;
       }
       const updatedAt = mapping.updatedAt ?? now;
-      const groupKey = this.buildSessionMappingGroupKey({
-        openclawUserId,
-        groupId,
-      });
+      const groupKey = groupId
+        ? this.buildSessionMappingGroupKey({
+            openclawUserId,
+            groupId,
+          })
+        : undefined;
       const normalizedSessionKey = this.normalizeSessionMappingSessionKey(sessionKey);
       const previousBySession = this.sessionMappingBySessionKey.get(normalizedSessionKey);
-      if (previousBySession && previousBySession.groupKey !== groupKey) {
+      if (previousBySession?.groupKey && previousBySession.groupKey !== groupKey) {
         this.sessionMappingByGroupKey.delete(previousBySession.groupKey);
       }
-      this.sessionMappingByGroupKey.set(groupKey, { sessionKey, updatedAt });
-      this.sessionMappingBySessionKey.set(normalizedSessionKey, { groupKey, updatedAt });
+      if (groupKey) {
+        this.sessionMappingByGroupKey.set(groupKey, { sessionKey, updatedAt });
+      }
+      this.sessionMappingBySessionKey.set(normalizedSessionKey, {
+        ...(groupKey ? { groupKey } : {}),
+        updatedAt,
+        parentSessionKey: this.normalizeOptionalSessionKey(mapping.parentSessionKey),
+        rootSessionKey: this.normalizeOptionalSessionKey(mapping.rootSessionKey),
+        effectiveTargetSessionKey: this.normalizeOptionalSessionKey(
+          mapping.effectiveTargetSessionKey,
+        ),
+      });
     }
     if (signal.type === "session_mapping_snapshot") {
       void this.seedMissingSessionMappingsFromLocalStore();
@@ -430,51 +545,58 @@ class ClawchatSession {
     return normalized.includes(":clawchat:") || normalized.includes(":clawchat-router:");
   }
 
-  private async listLocalSessionKeysForMappingSeed(): Promise<string[]> {
-    const cfg = (await getClawchatRuntime().config.loadConfig()) as OpenClawConfig;
-    const storePath = getClawchatRuntime().channel.session.resolveStorePath(cfg.session?.store, {
-      agentId: DEFAULT_AGENT_ID,
-    });
-    try {
-      const raw = fs.readFileSync(storePath, "utf8");
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return [];
-      }
-      return Object.entries(parsed)
-        .map(([sessionKey, entry]) => {
-          const normalizedSessionKey = this.normalizeSessionMappingSessionKey(sessionKey);
-          const sessionEntry = asPlainObject(entry);
-          const spawnDepthRaw =
-            typeof sessionEntry?.spawnDepth === "number"
-              ? sessionEntry.spawnDepth
-              : Number(sessionEntry?.spawnDepth ?? 0);
-          const endedAtRaw =
-            typeof sessionEntry?.endedAt === "number"
-              ? sessionEntry.endedAt
-              : Number(sessionEntry?.endedAt ?? 0);
-          if (!normalizedSessionKey) {
-            return null;
-          }
-          if (this.isClawchatCreatedSessionKey(normalizedSessionKey)) {
-            return null;
-          }
-          if (Number.isFinite(spawnDepthRaw) && spawnDepthRaw > 0) {
-            return null;
-          }
-          if (Number.isFinite(endedAtRaw) && endedAtRaw > 0) {
-            return null;
-          }
-          return sessionKey.trim();
-        })
-        .filter((sessionKey): sessionKey is string => Boolean(sessionKey));
-    } catch (err) {
-      logWarn("failed to list local sessions for mapping seed", {
-        err,
-        storePath,
-      });
-      return [];
-    }
+  private async listLocalSessionsForMappingSeed(): Promise<
+    Array<{
+      sessionKey: string;
+      parentSessionKey?: string;
+      rootSessionKey?: string;
+      spawnDepth?: number;
+    }>
+  > {
+    const parsed = await this.loadLocalSessionStore();
+    return Object.entries(parsed)
+      .map(([sessionKey, entry]) => {
+        const normalizedSessionKey = this.normalizeSessionMappingSessionKey(sessionKey);
+        const sessionEntry = asPlainObject(entry);
+        const endedAtRaw =
+          typeof sessionEntry?.endedAt === "number"
+            ? sessionEntry.endedAt
+            : Number(sessionEntry?.endedAt ?? 0);
+        const spawnDepthRaw =
+          typeof sessionEntry?.spawnDepth === "number"
+            ? sessionEntry.spawnDepth
+            : Number(sessionEntry?.spawnDepth ?? NaN);
+        if (!normalizedSessionKey) {
+          return null;
+        }
+        if (this.isClawchatCreatedSessionKey(normalizedSessionKey)) {
+          return null;
+        }
+        if (Number.isFinite(endedAtRaw) && endedAtRaw > 0) {
+          return null;
+        }
+        const result: {
+          sessionKey: string;
+          parentSessionKey?: string;
+          rootSessionKey?: string;
+          spawnDepth?: number;
+        } = {
+          sessionKey: sessionKey.trim(),
+        };
+        const parentSessionKey = this.resolveLocalParentSessionKey(sessionEntry);
+        const rootSessionKey = this.resolveLocalRootSessionKey(normalizedSessionKey, parsed);
+        if (parentSessionKey) {
+          result.parentSessionKey = parentSessionKey;
+        }
+        if (rootSessionKey) {
+          result.rootSessionKey = rootSessionKey;
+        }
+        if (Number.isFinite(spawnDepthRaw) && spawnDepthRaw >= 0) {
+          result.spawnDepth = spawnDepthRaw;
+        }
+        return result;
+      })
+      .filter((session): session is NonNullable<typeof session> => Boolean(session?.sessionKey));
   }
 
   private async seedMissingSessionMappingsFromLocalStore(): Promise<void> {
@@ -488,26 +610,29 @@ class ClawchatSession {
       if (!account.allowManage) {
         return;
       }
-      const sessionKeys = await this.listLocalSessionKeysForMappingSeed();
-      const missingSessionKeys = sessionKeys.filter((sessionKey) => {
-        const normalized = this.normalizeSessionMappingSessionKey(sessionKey);
+      const sessions = await this.listLocalSessionsForMappingSeed();
+      const missingSessions = sessions.filter((session) => {
+        const normalized = this.normalizeSessionMappingSessionKey(session.sessionKey);
         return !this.sessionMappingBySessionKey.has(normalized);
       });
-      if (missingSessionKeys.length === 0) {
+      if (missingSessions.length === 0) {
         logDebug("no missing local sessions to seed mapping", {
-          sessionCount: sessionKeys.length,
+          sessionCount: sessions.length,
         });
         return;
       }
       logDebug("seeding missing local session mappings from snapshot", {
-        totalLocalSessions: sessionKeys.length,
-        missingMappings: missingSessionKeys.length,
-        sessionKeys: missingSessionKeys,
+        totalLocalSessions: sessions.length,
+        missingMappings: missingSessions.length,
+        sessionKeys: missingSessions.map((session) => session.sessionKey),
       });
-      for (const sessionKey of missingSessionKeys) {
+      for (const session of missingSessions) {
         await this.sendSessionMessageSyncToSelf({
-          sessionFile: sessionKey,
-          sessionKey,
+          sessionFile: session.sessionKey,
+          sessionKey: session.sessionKey,
+          parentSessionKey: session.parentSessionKey,
+          rootSessionKey: session.rootSessionKey,
+          spawnDepth: session.spawnDepth,
           source: "control_ui_user",
           message: {
             role: "user",
@@ -1149,6 +1274,9 @@ class ClawchatSession {
     message?: unknown;
     messageId?: string;
     source?: string;
+    parentSessionKey?: string;
+    rootSessionKey?: string;
+    spawnDepth?: number;
   }): Promise<void> {
     if (!this.client || !this.selfId || !this.client.isLogin?.()) {
       return;
@@ -1159,6 +1287,20 @@ class ClawchatSession {
       return;
     }
     const message = asPlainObject(update.message);
+    const normalizedSessionKey =
+      (typeof update.sessionKey === "string" && update.sessionKey.trim()) ||
+      String(update.sessionFile ?? "");
+    const shouldResolveLineage =
+      normalizedSessionKey.includes(":subagent:") ||
+      typeof update.parentSessionKey === "string" ||
+      typeof update.rootSessionKey === "string" ||
+      typeof update.spawnDepth === "number";
+    const lineage =
+      normalizedSessionKey &&
+      shouldResolveLineage &&
+      (!update.parentSessionKey || !update.rootSessionKey || typeof update.spawnDepth !== "number")
+        ? await this.resolveLocalSessionLineage(normalizedSessionKey)
+        : {};
     const role =
       typeof message?.role === "string" && message.role.trim() ? message.role.trim() : undefined;
     const content =
@@ -1166,9 +1308,22 @@ class ClawchatSession {
         ? message.content
         : update.message;
     const normalizedPayload = {
-      session:
-        (typeof update.sessionKey === "string" && update.sessionKey.trim()) ||
-        String(update.sessionFile ?? ""),
+      session: normalizedSessionKey,
+      ...(typeof update.parentSessionKey === "string" && update.parentSessionKey.trim()
+        ? { parent_session: update.parentSessionKey.trim() }
+        : lineage.parentSessionKey
+          ? { parent_session: lineage.parentSessionKey }
+          : {}),
+      ...(typeof update.rootSessionKey === "string" && update.rootSessionKey.trim()
+        ? { root_session: update.rootSessionKey.trim() }
+        : lineage.rootSessionKey
+          ? { root_session: lineage.rootSessionKey }
+          : {}),
+      ...(typeof update.spawnDepth === "number" && Number.isFinite(update.spawnDepth)
+        ? { spawn_depth: update.spawnDepth }
+        : typeof lineage.spawnDepth === "number" && Number.isFinite(lineage.spawnDepth)
+          ? { spawn_depth: lineage.spawnDepth }
+          : {}),
       ...(typeof update.source === "string" && update.source.trim()
         ? { source: update.source.trim() }
         : {}),
