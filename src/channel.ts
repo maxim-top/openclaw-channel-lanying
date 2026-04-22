@@ -346,6 +346,7 @@ class ClawchatSession {
   private routerGroupQueueByGroupId = new Map<string, { tail: Promise<void>; pending: number }>();
   private sessionMappingByGroupKey = new Map<string, { sessionKey: string; updatedAt: number }>();
   private sessionMappingBySessionKey = new Map<string, { groupKey: string; updatedAt: number }>();
+  private missingSessionMappingSeedPromise: Promise<void> | null = null;
   private readonly messageFlow = createClawchatSessionMessageFlow({
     getSelfId: () => this.selfId,
     updateSelfIdFromClient: (reason) => this.updateSelfIdFromClient(reason),
@@ -418,6 +419,110 @@ class ClawchatSession {
       }
       this.sessionMappingByGroupKey.set(groupKey, { sessionKey, updatedAt });
       this.sessionMappingBySessionKey.set(normalizedSessionKey, { groupKey, updatedAt });
+    }
+    if (signal.type === "session_mapping_snapshot") {
+      void this.seedMissingSessionMappingsFromLocalStore();
+    }
+  }
+
+  private isClawchatCreatedSessionKey(sessionKey: string): boolean {
+    const normalized = this.normalizeSessionMappingSessionKey(sessionKey);
+    return normalized.includes(":clawchat:") || normalized.includes(":clawchat-router:");
+  }
+
+  private async listLocalSessionKeysForMappingSeed(): Promise<string[]> {
+    const cfg = (await getClawchatRuntime().config.loadConfig()) as OpenClawConfig;
+    const storePath = getClawchatRuntime().channel.session.resolveStorePath(cfg.session?.store, {
+      agentId: DEFAULT_AGENT_ID,
+    });
+    try {
+      const raw = fs.readFileSync(storePath, "utf8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return [];
+      }
+      return Object.entries(parsed)
+        .map(([sessionKey, entry]) => {
+          const normalizedSessionKey = this.normalizeSessionMappingSessionKey(sessionKey);
+          const sessionEntry = asPlainObject(entry);
+          const spawnDepthRaw =
+            typeof sessionEntry?.spawnDepth === "number"
+              ? sessionEntry.spawnDepth
+              : Number(sessionEntry?.spawnDepth ?? 0);
+          const endedAtRaw =
+            typeof sessionEntry?.endedAt === "number"
+              ? sessionEntry.endedAt
+              : Number(sessionEntry?.endedAt ?? 0);
+          if (!normalizedSessionKey) {
+            return null;
+          }
+          if (this.isClawchatCreatedSessionKey(normalizedSessionKey)) {
+            return null;
+          }
+          if (Number.isFinite(spawnDepthRaw) && spawnDepthRaw > 0) {
+            return null;
+          }
+          if (Number.isFinite(endedAtRaw) && endedAtRaw > 0) {
+            return null;
+          }
+          return sessionKey.trim();
+        })
+        .filter((sessionKey): sessionKey is string => Boolean(sessionKey));
+    } catch (err) {
+      logWarn("failed to list local sessions for mapping seed", {
+        err,
+        storePath,
+      });
+      return [];
+    }
+  }
+
+  private async seedMissingSessionMappingsFromLocalStore(): Promise<void> {
+    if (this.missingSessionMappingSeedPromise) {
+      await this.missingSessionMappingSeedPromise;
+      return;
+    }
+    const run = (async () => {
+      const cfg = (await getClawchatRuntime().config.loadConfig()) as OpenClawConfig;
+      const account = resolveClawchatAccount(cfg);
+      if (!account.allowManage) {
+        return;
+      }
+      const sessionKeys = await this.listLocalSessionKeysForMappingSeed();
+      const missingSessionKeys = sessionKeys.filter((sessionKey) => {
+        const normalized = this.normalizeSessionMappingSessionKey(sessionKey);
+        return !this.sessionMappingBySessionKey.has(normalized);
+      });
+      if (missingSessionKeys.length === 0) {
+        logDebug("no missing local sessions to seed mapping", {
+          sessionCount: sessionKeys.length,
+        });
+        return;
+      }
+      logDebug("seeding missing local session mappings from snapshot", {
+        totalLocalSessions: sessionKeys.length,
+        missingMappings: missingSessionKeys.length,
+        sessionKeys: missingSessionKeys,
+      });
+      for (const sessionKey of missingSessionKeys) {
+        await this.sendSessionMessageSyncToSelf({
+          sessionFile: sessionKey,
+          sessionKey,
+          source: "control_ui_user",
+          message: {
+            role: "user",
+            content: "",
+          },
+        });
+      }
+    })();
+    this.missingSessionMappingSeedPromise = run;
+    try {
+      await run;
+    } finally {
+      if (this.missingSessionMappingSeedPromise === run) {
+        this.missingSessionMappingSeedPromise = null;
+      }
     }
   }
 
