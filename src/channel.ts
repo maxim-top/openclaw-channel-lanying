@@ -16,6 +16,10 @@ import {
   type RouterReplyTargetSnapshot,
   type SessionMappingSignal,
 } from "./channel/message.js";
+import {
+  buildRouterReplyMessage,
+  parseRouterDeliveryTarget,
+} from "./channel/router-target.js";
 import { createClawchatSessionMessageFlow } from "./channel/session-message-flow.js";
 import {
   findBaseHash,
@@ -344,6 +348,7 @@ class ClawchatSession {
     Array<{ senderId: string; senderName?: string; body: string; timestamp: number }>
   >();
   private routerGroupQueueByGroupId = new Map<string, { tail: Promise<void>; pending: number }>();
+  private routerReplySeq = 0;
   private sessionMappingByGroupKey = new Map<string, { sessionKey: string; updatedAt: number }>();
   private sessionMappingBySessionKey = new Map<
     string,
@@ -354,6 +359,10 @@ class ClawchatSession {
       rootSessionKey?: string;
       effectiveTargetSessionKey?: string;
     }
+  >();
+  private sessionSenderUserIdBySessionKey = new Map<
+    string,
+    { senderUserId: string; updatedAt: number }
   >();
   private missingSessionMappingSeedPromise: Promise<void> | null = null;
   private readonly messageFlow = createClawchatSessionMessageFlow({
@@ -377,6 +386,7 @@ class ClawchatSession {
     handlePresetPromptSync: (params) => this.handlePresetPromptSync(params),
     sendText: (target, text, account) => this.sendText(target, text, account),
     sendSessionMessageSyncToSelf: (update) => this.sendSessionMessageSyncToSelf(update),
+    rememberSessionSenderUserId: (params) => this.rememberSessionSenderUserId(params),
     resolveSessionMapping: (params) => this.resolveSessionMapping(params),
     applySessionMappingSignal: (signal) => this.applySessionMappingSignal(signal),
     pendingGroupContext: this.pendingGroupContext,
@@ -397,6 +407,36 @@ class ClawchatSession {
   private normalizeOptionalSessionKey(value: unknown): string | undefined {
     const normalized = this.normalizeSessionMappingSessionKey(String(value ?? ""));
     return normalized || undefined;
+  }
+
+  private rememberSessionSenderUserId(params: { sessionKey: string; senderUserId: string }): void {
+    const normalizedSessionKey = this.normalizeOptionalSessionKey(params.sessionKey);
+    const senderUserId = String(params.senderUserId ?? "").trim();
+    if (!normalizedSessionKey || !senderUserId) {
+      return;
+    }
+    this.sessionSenderUserIdBySessionKey.set(normalizedSessionKey, {
+      senderUserId,
+      updatedAt: Date.now(),
+    });
+  }
+
+  private resolveRememberedSessionSenderUserId(
+    sessionKey: string,
+    lineage?: { parentSessionKey?: string; rootSessionKey?: string },
+  ): string | undefined {
+    const candidates = [
+      this.normalizeOptionalSessionKey(sessionKey),
+      this.normalizeOptionalSessionKey(lineage?.parentSessionKey),
+      this.normalizeOptionalSessionKey(lineage?.rootSessionKey),
+    ].filter((value): value is string => Boolean(value));
+    for (const candidate of candidates) {
+      const remembered = this.sessionSenderUserIdBySessionKey.get(candidate);
+      if (remembered?.senderUserId) {
+        return remembered.senderUserId;
+      }
+    }
+    return undefined;
   }
 
   private buildLocalSessionStorePath(cfg: OpenClawConfig): string {
@@ -485,6 +525,86 @@ class ClawchatSession {
       ...(parentSessionKey ? { parentSessionKey } : {}),
       ...(rootSessionKey ? { rootSessionKey } : {}),
       ...(Number.isFinite(spawnDepthRaw) && spawnDepthRaw >= 0 ? { spawnDepth: spawnDepthRaw } : {}),
+    };
+  }
+
+  private isGroupSessionKey(sessionKey?: string): boolean {
+    const normalized = this.normalizeOptionalSessionKey(sessionKey);
+    return Boolean(
+      normalized &&
+        (normalized.includes(":clawchat:group:") || normalized.includes(":clawchat-router:group:")),
+    );
+  }
+
+  private resolvePreferredReplySessionSyncTarget(params: {
+    sessionKey: string;
+    source?: string;
+    role?: string;
+  }): {
+    sessionKey: string;
+    parentSessionKey?: string;
+    rootSessionKey?: string;
+  } | null {
+    const normalizedSessionKey = this.normalizeOptionalSessionKey(params.sessionKey);
+    if (
+      !normalizedSessionKey ||
+      params.source !== "control_ui_reply" ||
+      params.role !== "assistant" ||
+      !normalizedSessionKey.includes(":clawchat-router:direct:")
+    ) {
+      return null;
+    }
+
+    const currentEntry = this.sessionMappingBySessionKey.get(normalizedSessionKey);
+    const targetSessionKey = this.normalizeOptionalSessionKey(
+      currentEntry?.effectiveTargetSessionKey,
+    );
+    if (!targetSessionKey || targetSessionKey === normalizedSessionKey) {
+      return null;
+    }
+
+    const targetEntry = this.sessionMappingBySessionKey.get(targetSessionKey);
+    if (!targetEntry) {
+      return null;
+    }
+    const targetParentSessionKey = this.normalizeOptionalSessionKey(targetEntry.parentSessionKey);
+    const targetParentEntry = targetParentSessionKey
+      ? this.sessionMappingBySessionKey.get(targetParentSessionKey)
+      : undefined;
+    const parentLooksGroup =
+      this.isGroupSessionKey(targetParentSessionKey) || Boolean(targetParentEntry?.groupKey);
+    if (!parentLooksGroup) {
+      return null;
+    }
+    return {
+      sessionKey: targetSessionKey,
+      ...(targetParentSessionKey ? { parentSessionKey: targetParentSessionKey } : {}),
+      ...(targetEntry.rootSessionKey
+        ? { rootSessionKey: this.normalizeOptionalSessionKey(targetEntry.rootSessionKey) }
+        : {}),
+    };
+  }
+
+  private resolveSessionMappingLineage(sessionKey: string): {
+    parentSessionKey?: string;
+    rootSessionKey?: string;
+  } | null {
+    const normalizedSessionKey = this.normalizeOptionalSessionKey(sessionKey);
+    if (!normalizedSessionKey) {
+      return null;
+    }
+    const entry = this.sessionMappingBySessionKey.get(normalizedSessionKey);
+    if (!entry) {
+      return null;
+    }
+    const parentSessionKey = this.normalizeOptionalSessionKey(entry.parentSessionKey);
+    const rootSessionKey = this.normalizeOptionalSessionKey(entry.rootSessionKey);
+    if (!parentSessionKey && !rootSessionKey) {
+      return null;
+    }
+    return {
+      ...(parentSessionKey ? { parentSessionKey } : {}),
+      ...(rootSessionKey ? { rootSessionKey } : {}),
     };
   }
 
@@ -1269,6 +1389,46 @@ class ClawchatSession {
     });
   }
 
+  private nextRouterReplyMessageId(): string {
+    this.routerReplySeq = (this.routerReplySeq + 1) % 1_000_000;
+    return `router_reply_${Date.now()}_${this.routerReplySeq}`;
+  }
+
+  async sendRouterTargetText(
+    rawTarget: string,
+    text: string,
+    account?: ResolvedClawchatAccount,
+  ): Promise<string> {
+    const target = parseRouterDeliveryTarget(rawTarget);
+    if (!target) {
+      throw new Error(`Invalid ClawChat router target: ${rawTarget}`);
+    }
+    const cfgToUse = account ?? this.lastConfig;
+    if (!cfgToUse) {
+      throw new Error("ClawChat session has no account context");
+    }
+    await this.ensureReady(cfgToUse);
+    if (!this.client || !this.selfId) {
+      throw new Error("ClawChat client is not ready for router delivery");
+    }
+
+    const messageId = this.nextRouterReplyMessageId();
+    logDebug("sending router target via self-loop", {
+      kind: target.kind,
+      id: target.id,
+      textPreview: text.slice(0, 80),
+    });
+    await this.sendRouterReplyToSelf(
+      buildRouterReplyMessage({
+        id: messageId,
+        from: this.selfId,
+        target,
+        text,
+      }),
+    );
+    return messageId;
+  }
+
   async sendSessionMessageSyncToSelf(update: {
     sessionFile: string;
     sessionKey?: string;
@@ -1309,28 +1469,72 @@ class ClawchatSession {
       message && Object.prototype.hasOwnProperty.call(message, "content")
         ? message.content
         : update.message;
+    const sessionSyncOverride = normalizedSessionKey
+      ? this.resolvePreferredReplySessionSyncTarget({
+          sessionKey: normalizedSessionKey,
+          source: typeof update.source === "string" ? update.source.trim() : undefined,
+          role,
+        })
+      : null;
+    const payloadSessionKey = sessionSyncOverride?.sessionKey ?? normalizedSessionKey;
+    const mappedPayloadLineage = payloadSessionKey
+      ? this.resolveSessionMappingLineage(payloadSessionKey)
+      : null;
+    const updateParentSessionKey = this.normalizeOptionalSessionKey(update.parentSessionKey);
+    const updateRootSessionKey = this.normalizeOptionalSessionKey(update.rootSessionKey);
+    const payloadLineage = {
+      parentSessionKey:
+        sessionSyncOverride?.parentSessionKey ??
+        mappedPayloadLineage?.parentSessionKey ??
+        updateParentSessionKey ??
+        lineage.parentSessionKey,
+      rootSessionKey:
+        sessionSyncOverride?.rootSessionKey ??
+        mappedPayloadLineage?.rootSessionKey ??
+        updateRootSessionKey ??
+        lineage.rootSessionKey,
+      spawnDepth:
+        typeof update.spawnDepth === "number" && Number.isFinite(update.spawnDepth)
+          ? update.spawnDepth
+          : lineage.spawnDepth,
+    };
+    if (sessionSyncOverride) {
+      logDebug("override session_message_sync target for control_ui_reply", {
+        originalSessionKey: normalizedSessionKey,
+        overriddenSessionKey: payloadSessionKey,
+        parentSessionKey: payloadLineage.parentSessionKey,
+        rootSessionKey: payloadLineage.rootSessionKey,
+      });
+    }
+    const rememberedSenderUserId =
+      typeof update.senderUserId === "string" && update.senderUserId.trim()
+        ? update.senderUserId.trim()
+        : payloadSessionKey
+          ? this.resolveRememberedSessionSenderUserId(payloadSessionKey, payloadLineage)
+          : undefined;
+    if (payloadSessionKey && rememberedSenderUserId) {
+      this.rememberSessionSenderUserId({
+        sessionKey: payloadSessionKey,
+        senderUserId: rememberedSenderUserId,
+      });
+    }
     const normalizedPayload = {
-      session: normalizedSessionKey,
-      ...(typeof update.parentSessionKey === "string" && update.parentSessionKey.trim()
-        ? { parent_session: update.parentSessionKey.trim() }
-        : lineage.parentSessionKey
-          ? { parent_session: lineage.parentSessionKey }
-          : {}),
-      ...(typeof update.rootSessionKey === "string" && update.rootSessionKey.trim()
-        ? { root_session: update.rootSessionKey.trim() }
-        : lineage.rootSessionKey
-          ? { root_session: lineage.rootSessionKey }
-          : {}),
-      ...(typeof update.spawnDepth === "number" && Number.isFinite(update.spawnDepth)
-        ? { spawn_depth: update.spawnDepth }
-        : typeof lineage.spawnDepth === "number" && Number.isFinite(lineage.spawnDepth)
-          ? { spawn_depth: lineage.spawnDepth }
+      session: payloadSessionKey,
+      ...(payloadLineage.parentSessionKey
+        ? { parent_session: payloadLineage.parentSessionKey }
+        : {}),
+      ...(payloadLineage.rootSessionKey
+        ? { root_session: payloadLineage.rootSessionKey }
+        : {}),
+      ...(typeof payloadLineage.spawnDepth === "number" &&
+        Number.isFinite(payloadLineage.spawnDepth)
+          ? { spawn_depth: payloadLineage.spawnDepth }
           : {}),
       ...(typeof update.source === "string" && update.source.trim()
         ? { source: update.source.trim() }
         : {}),
-      ...(typeof update.senderUserId === "string" && update.senderUserId.trim()
-        ? { sender_user_id: update.senderUserId.trim() }
+      ...(rememberedSenderUserId
+        ? { sender_user_id: rememberedSenderUserId }
         : {}),
       message: message
         ? {
@@ -1970,9 +2174,17 @@ export const clawchatPlugin: any = {
     },
   },
   messaging: {
-    normalizeTarget: (raw: any) => normalizeTarget(raw)?.id,
+    normalizeTarget: (raw: any) => {
+      if (typeof raw === "string" && parseRouterDeliveryTarget(raw)) {
+        return raw.trim();
+      }
+      return normalizeTarget(raw)?.id;
+    },
     targetResolver: {
       looksLikeId: (raw: any) => {
+        if (typeof raw === "string" && parseRouterDeliveryTarget(raw)) {
+          return true;
+        }
         const normalized = normalizeTarget(raw);
         return Boolean(normalized?.id);
       },
@@ -1990,6 +2202,15 @@ export const clawchatPlugin: any = {
       });
       if (!account.enabled) {
         throw new Error("ClawChat channel is disabled.");
+      }
+      const rawTarget = typeof to === "string" ? to.trim() : "";
+      if (parseRouterDeliveryTarget(rawTarget)) {
+        const messageId = await session.sendRouterTargetText(rawTarget, text, account);
+        return {
+          channel: CLAWCHAT_CHANNEL_ID,
+          messageId: String(messageId ?? ""),
+          chatId: rawTarget,
+        };
       }
       const target = normalizeTarget(to);
       if (!target || !target.id) {
