@@ -181,6 +181,34 @@ test("group mapped session inbound preserves origin for execution while sanitizi
   assert.deepEqual(harness.texts[0]?.target, { kind: "group", id: "group-7" });
 });
 
+test("group inbound stays on the root route session even if a stale mapped subagent session exists", async () => {
+  const harness = createMessageFlowHarness({
+    mappedSessionKey: "agent:main:subagent:child-7",
+    routeSessionKey: "agent:main:clawchat:group:group-7",
+  });
+
+  await harness.flow.onInbound(
+    {
+      id: "msg-group-child-mapping-1",
+      from: "sender-user",
+      to: "group-7",
+      toType: "group",
+      content: "hello after child mapping drift",
+      timestamp: 67901,
+    },
+    "group",
+    createBaseAccount(),
+  );
+
+  assert.equal(harness.recorded.length, 1);
+  assert.equal(harness.dispatched.length, 1);
+  assert.equal(harness.recorded[0]?.SessionKey, "agent:main:clawchat:group:group-7");
+  assert.equal(harness.dispatched[0]?.SessionKey, "agent:main:clawchat:group:group-7");
+  assert.equal(harness.routes.length, 1);
+  assert.equal(harness.routes[0]?.sessionKey, "agent:main:clawchat:group:group-7");
+  assert.equal(harness.dispatched[0]?.OriginatingTo, "group-7");
+});
+
 test("direct inbound remembers and seeds the external sender user instead of the OpenClaw user", async () => {
   const harness = createMessageFlowHarness({
     routeSessionKey: "agent:main:clawchat:group:parent-group",
