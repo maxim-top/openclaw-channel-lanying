@@ -4,8 +4,15 @@
   "private": false,
   "description": "OpenClaw ClawChat IM channel plugin",
   "type": "module",
+  "scripts": {
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
   "devDependencies": {
-    "openclaw": "latest"
+    "@types/node": "^22.0.0",
+    "openclaw": "latest",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
   },
   "main": "./index.ts",
   "openclaw": {
