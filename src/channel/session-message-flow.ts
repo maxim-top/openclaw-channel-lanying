@@ -357,23 +357,24 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       mode: params.mode,
       targetId: params.targetId,
     });
-    const inboundSessionKey = mappedSessionKey || route.sessionKey;
+    const selectedSessionKey = (mappedSessionKey || route.sessionKey).trim();
     const storePath = ctx.resolveStorePath(params.cfg.session?.store, {
       agentId: route.agentId,
     });
     const previousTimestamp = ctx.readSessionUpdatedAt({
       storePath,
-      sessionKey: inboundSessionKey,
+      sessionKey: selectedSessionKey,
     });
     const envelopeOptions = ctx.resolveEnvelopeFormatOptions(params.cfg);
     const conversationLabel =
       params.mode === "direct"
         ? params.senderName?.trim() || params.senderId || params.targetId
         : params.targetId;
+    const bodyForEnvelope = params.commandAuthorized ? params.commandBody : params.rawBody;
     const envelopeBody = ctx.formatAgentEnvelope({
       channel: "ClawChat",
       from: conversationLabel,
-      body: params.rawBody,
+      body: bodyForEnvelope,
       timestamp: params.timestamp,
       previousTimestamp,
       envelope: envelopeOptions,
@@ -383,10 +384,11 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       BodyForAgent: params.bodyForAgent,
       RawBody: params.rawBody,
       CommandBody: params.commandBody,
+      BodyForCommands: params.commandBody,
       CommandAuthorized: params.commandAuthorized,
       From: params.senderId || params.targetId,
       To: params.dispatchTo,
-      SessionKey: inboundSessionKey,
+      SessionKey: selectedSessionKey,
       AccountId: route.accountId ?? params.account.accountId,
       ChatType: params.mode,
       SenderId: params.senderId || undefined,
@@ -405,10 +407,11 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
         sourceTool: "clawchat_im",
       },
     });
-    const persistedSessionKey =
-      typeof finalizedCtx.SessionKey === "string" && finalizedCtx.SessionKey.trim()
-        ? finalizedCtx.SessionKey.trim()
-        : route.sessionKey;
+    const persistedSessionKey = selectedSessionKey || route.sessionKey;
+    const finalizedCtxWithSessionKey = {
+      ...finalizedCtx,
+      SessionKey: persistedSessionKey,
+    };
     const updateLastRouteSessionKey =
       mappedSessionKey || (route.lastRoutePolicy === "main" ? route.mainSessionKey : persistedSessionKey);
     const shouldSanitizeSessionMetadata = Boolean(
@@ -456,7 +459,10 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
         messageId: params.messageId || undefined,
       });
     }
-    const executionCtx = buildExecutionSafeSessionCtx(finalizedCtx, shouldSanitizeSessionMetadata);
+    const executionCtx = buildExecutionSafeSessionCtx(
+      finalizedCtxWithSessionKey,
+      shouldSanitizeSessionMetadata,
+    );
     if (shouldSanitizeSessionMetadata) {
       logDebug("mapped session execution origin preserved", {
         reason: "mapped_session_runtime_origin_inheritance",
@@ -478,7 +484,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
     await ctx.recordInboundSession({
       storePath,
       sessionKey: persistedSessionKey,
-      ctx: buildMetadataSafeSessionCtx(finalizedCtx, shouldSanitizeSessionMetadata),
+      ctx: buildMetadataSafeSessionCtx(finalizedCtxWithSessionKey, shouldSanitizeSessionMetadata),
       updateLastRoute,
       onRecordError: (err: unknown) => {
         logError("failed to record inbound session", {
@@ -800,7 +806,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
         ? buildBodyWithPendingGroupContext(replyTo, commandBody, isSlashCommand)
         : commandBody;
     const bodyWithKnowledge =
-      knowledge.trim().length > 0
+      !isSlashCommand && knowledge.trim().length > 0
         ? [
             "[Retrieved knowledge context]",
             knowledge.trim(),
@@ -834,19 +840,21 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
     const storePath = ctx.resolveStorePath(cfg.session?.store, {
       agentId: route.agentId,
     });
+    const selectedSessionKey = (mappedSessionKey || route.sessionKey).trim();
     const previousTimestamp = ctx.readSessionUpdatedAt({
       storePath,
-      sessionKey: mappedSessionKey || route.sessionKey,
+      sessionKey: selectedSessionKey,
     });
     const envelopeOptions = ctx.resolveEnvelopeFormatOptions(cfg);
     const conversationLabel =
       inboundMode === "group"
         ? routerGroupId || replyTo || toId || selfId
         : fromId || directUserId || inboundPeerId;
+    const bodyForEnvelope = isSlashCommand ? commandBody : body;
     const envelopeBody = ctx.formatAgentEnvelope({
       channel: "ClawChat",
       from: conversationLabel,
-      body,
+      body: bodyForEnvelope,
       timestamp: Number.isFinite(timestampNum) ? timestampNum : Date.now(),
       previousTimestamp,
       envelope: envelopeOptions,
@@ -859,12 +867,12 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       Body: envelopeBody,
       BodyForAgent: bodyWithKnowledge,
       RawBody: body,
-      CommandBody: cleanedBody,
-      BodyForCommands: cleanedBody,
+      CommandBody: commandBody,
+      BodyForCommands: commandBody,
       CommandAuthorized: isSlashCommand,
       From: inboundMode === "group" ? fromId || toId || selfId : fromId || directUserId,
       To: dispatchTo,
-      SessionKey: mappedSessionKey || route.sessionKey,
+      SessionKey: selectedSessionKey,
       RouterRelay: routerRelayMark,
       AccountId: route.accountId ?? account.accountId,
       MessageSid: messageSid || undefined,
@@ -884,10 +892,11 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       SenderName: resolveSenderNameFromConfig(routerMeta, routerMeta) || fromId || undefined,
       ConversationLabel: conversationLabel,
     });
-    const persistedSessionKey =
-      typeof finalizedCtx.SessionKey === "string" && finalizedCtx.SessionKey.trim()
-        ? finalizedCtx.SessionKey.trim()
-        : route.sessionKey;
+    const persistedSessionKey = selectedSessionKey || route.sessionKey;
+    const finalizedCtxWithSessionKey = {
+      ...finalizedCtx,
+      SessionKey: persistedSessionKey,
+    };
     const updateLastRouteSessionKey =
       mappedSessionKey || (route.lastRoutePolicy === "main" ? route.mainSessionKey : persistedSessionKey);
     const shouldSanitizeSessionMetadata = Boolean(
@@ -944,7 +953,10 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
         messageId: messageSid || undefined,
       });
     }
-    const executionCtx = buildExecutionSafeSessionCtx(finalizedCtx, shouldSanitizeSessionMetadata);
+    const executionCtx = buildExecutionSafeSessionCtx(
+      finalizedCtxWithSessionKey,
+      shouldSanitizeSessionMetadata,
+    );
     if (shouldSanitizeSessionMetadata) {
       logDebug("mapped session execution origin preserved", {
         reason: "mapped_session_runtime_origin_inheritance",
@@ -967,7 +979,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
     await ctx.recordInboundSession({
       storePath,
       sessionKey: persistedSessionKey,
-      ctx: buildMetadataSafeSessionCtx(finalizedCtx, shouldSanitizeSessionMetadata),
+      ctx: buildMetadataSafeSessionCtx(finalizedCtxWithSessionKey, shouldSanitizeSessionMetadata),
       updateLastRoute,
       onRecordError: (err: unknown) => {
         logError("router_request recordInboundSession failed", {
@@ -1119,8 +1131,10 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       const routerSignal = extractRouterSignal(eventAny, meta);
       const sessionMappingSignal = extractSessionMappingSignal(eventAny, meta);
       const sessionMessageSyncSignal = extractSessionMessageSyncSignal(eventAny, meta);
-      if (sessionMessageSyncSignal && !isCommandOuterMessage(eventAny, meta)) {
-        logDebug("skip inbound session_message_sync: outer type is not command", {
+      const isCommandOuter = isCommandOuterMessage(eventAny, meta);
+      const isSessionMessageSyncControlEnvelope = sessionMessageSyncSignal && isCommandOuter;
+      if (sessionMessageSyncSignal && !isCommandOuter) {
+        logDebug("ignore inbound session_message_sync hint: outer type is not command", {
           senderId,
           toId: toIdRaw,
           targetId,
@@ -1131,11 +1145,10 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
           role: sessionMessageSyncSignal.role,
           messageId: sessionMessageSyncSignal.messageId,
         });
-        return;
       }
       if (mode === "direct" && senderId && toIdRaw && senderId === toIdRaw) {
         const isSelfLoopback = Boolean(selfId && senderId === selfId);
-        if (sessionMessageSyncSignal) {
+        if (isSessionMessageSyncControlEnvelope) {
           logDebug("consume loopback session_message_sync control envelope", {
             senderId,
             toId: toIdRaw,
@@ -1347,7 +1360,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
         });
         return;
       }
-      if (sessionMessageSyncSignal) {
+      if (isSessionMessageSyncControlEnvelope) {
         logDebug("skip inbound session_message_sync control envelope", {
           senderId,
           toId: toIdRaw,

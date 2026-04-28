@@ -196,6 +196,83 @@ test("non-self session_message_sync envelope is not treated as user text", async
   assert.equal(harness.texts.length, 0);
 });
 
+test("non-command inbound keeps normal processing even when ext carries session_message_sync hint", async () => {
+  const harness = createMessageFlowHarness();
+
+  await harness.flow.onInbound(
+    {
+      id: "sync-hint-text-1",
+      from: "other-user",
+      to: "openclaw-user",
+      type: "text",
+      toType: "roster",
+      content: "hello from im",
+      ext: createSessionMessageSyncExt(),
+      timestamp: 1004,
+    },
+    "direct",
+    createBaseAccount(),
+  );
+
+  assert.equal(harness.recorded.length, 1);
+  assert.equal(harness.dispatched.length, 1);
+  assert.equal(harness.texts.length, 1);
+});
+
+test("native mentioned slash command dispatches cleaned command while preserving raw text", async () => {
+  const harness = createMessageFlowHarness({
+    mappedSessionKey: "agent:main:clawchat:group:group-42",
+  });
+
+  await harness.flow.onInbound(
+    {
+      id: "native-mentioned-command-1",
+      from: "sender-user",
+      to: "group-42",
+      type: "text",
+      toType: "group",
+      content: "@openclaw_15_b121553b  /subagents spawn main 讲个数字1的笑话吧",
+      timestamp: 1005,
+      config: {
+        mentionList: ["openclaw-user"],
+      },
+    },
+    "group",
+    createBaseAccount(),
+    "onGroupMessage",
+  );
+
+  assert.equal(harness.dispatched.length, 1);
+  assert.equal(harness.dispatched[0]?.CommandBody, "/subagents spawn main 讲个数字1的笑话吧");
+  assert.equal(harness.dispatched[0]?.BodyForCommands, "/subagents spawn main 讲个数字1的笑话吧");
+  assert.equal(harness.dispatched[0]?.Body, "/subagents spawn main 讲个数字1的笑话吧");
+  assert.equal(harness.dispatched[0]?.RawBody, "@openclaw_15_b121553b  /subagents spawn main 讲个数字1的笑话吧");
+});
+
+test("native normal message keeps normal dispatch", async () => {
+  const harness = createMessageFlowHarness();
+
+  await harness.flow.onInbound(
+    {
+      id: "native-normal-1",
+      from: "sender-user",
+      to: "group-42",
+      type: "text",
+      toType: "group",
+      content: "@openclaw_15_b121553b 你好",
+      timestamp: 1006,
+      config: {
+        mentionList: ["openclaw-user"],
+      },
+    },
+    "group",
+    createBaseAccount(),
+    "onGroupMessage",
+  );
+
+  assert.equal(harness.dispatched.length, 1);
+});
+
 test("router_request keeps origin in execution ctx while sanitizing persisted mapped session metadata", async () => {
   const harness = createMessageFlowHarness({
     mappedSessionKey: "agent:main:clawchat:group:group-42",
@@ -233,6 +310,51 @@ test("router_request keeps origin in execution ctx while sanitizing persisted ma
   assert.equal(harness.routerReplies.length, 1);
   assert.equal(harness.texts.length, 0);
 });
+
+for (const [name, rawBody, commandBody] of [
+  [
+    "subagents spawn",
+    "@openclaw_15_b121553b  /subagents spawn main 讲个数字3的笑话吧",
+    "/subagents spawn main 讲个数字3的笑话吧",
+  ],
+  ["new", "@openclaw_15_b121553b /new", "/new"],
+  ["reset", "@openclaw_15_b121553b /reset soft", "/reset soft"],
+  ["status", "@openclaw_15_b121553b /status", "/status"],
+] as const) {
+  test(`router_request mentioned slash command ${name} is visible as cleaned command`, async () => {
+    const harness = createMessageFlowHarness({
+      mappedSessionKey: "agent:main:clawchat:group:group-42",
+    });
+
+    await harness.flow.handleRouterRequest(
+      {
+        id: `router-mentioned-${name}-1`,
+        from: "sender-user",
+        to: "openclaw-user",
+        content: rawBody,
+        toType: "group",
+        group_id: "group-42",
+        timestamp: 12346,
+      },
+      createBaseAccount(),
+      "knowledge that must not be attached to slash commands",
+      {
+        requestSid: `router-mentioned-${name}-1`,
+        replyKind: "group",
+        replyId: "group-42",
+      },
+    );
+
+    assert.equal(harness.recorded.length, 1);
+    assert.equal(harness.dispatched.length, 1);
+    assert.equal(harness.dispatched[0]?.Body, commandBody);
+    assert.equal(harness.dispatched[0]?.BodyForAgent, commandBody);
+    assert.equal(harness.dispatched[0]?.CommandBody, commandBody);
+    assert.equal(harness.dispatched[0]?.BodyForCommands, commandBody);
+    assert.equal(harness.dispatched[0]?.RawBody, rawBody);
+    assert.equal(harness.dispatched[0]?.CommandAuthorized, true);
+  });
+}
 
 test("group mapped session inbound preserves origin for execution while sanitizing persisted metadata", async () => {
   const harness = createMessageFlowHarness({

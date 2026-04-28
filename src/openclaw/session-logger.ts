@@ -158,12 +158,23 @@ function messageLooksLikeClawchatInbound(message: Record<string, unknown> | null
   ) {
     return true;
   }
-  const provenance = asPlainObject(message.provenance);
-  if (hasClawchatChannelHint(provenance?.sourceChannel)) {
-    return true;
+  const provenanceCandidates = [
+    asPlainObject(message.provenance),
+    asPlainObject(message.InputProvenance),
+  ];
+  for (const provenance of provenanceCandidates) {
+    if (!provenance) {
+      continue;
+    }
+    if (hasClawchatChannelHint(provenance.sourceChannel)) {
+      return true;
+    }
+    const sourceTool = normalizeHint(provenance.sourceTool);
+    if (sourceTool.includes("clawchat") || sourceTool.includes("lanying")) {
+      return true;
+    }
   }
-  const sourceTool = normalizeHint(provenance?.sourceTool);
-  return sourceTool.includes("clawchat") || sourceTool.includes("lanying");
+  return false;
 }
 
 function isSubagentBootstrapUserTurn(
