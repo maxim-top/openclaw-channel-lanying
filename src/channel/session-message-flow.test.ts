@@ -50,7 +50,7 @@ function createMessageFlowHarness(options?: {
   const dispatched: Array<Record<string, unknown>> = [];
   const routes: Array<Record<string, unknown>> = [];
   const routerReplies: Array<Record<string, unknown>> = [];
-  const texts: Array<{ target: unknown; text: string }> = [];
+  const texts: Array<{ target: unknown; text: string; ext?: Record<string, unknown> }> = [];
   const rememberedSenders: Array<{ sessionKey: string; senderUserId: string }> = [];
   const seededSyncs: Array<Record<string, unknown>> = [];
   const flow = createClawchatSessionMessageFlow({
@@ -82,8 +82,8 @@ function createMessageFlowHarness(options?: {
     sendPresetPromptSyncMarkerToSelf: async () => undefined,
     applyOpenClawConfigPatch: async () => undefined,
     handlePresetPromptSync: async () => undefined,
-    sendText: async (target, text) => {
-      texts.push({ target, text });
+    sendText: async (target, text, _account, ext) => {
+      texts.push({ target, text, ext: ext as Record<string, unknown> | undefined });
       return "msg-1";
     },
     sendSessionMessageSyncToSelf: async (update) => {
@@ -466,6 +466,12 @@ test("group mapped session inbound preserves origin for execution while sanitizi
   assert.equal(harness.routes[0]?.to, "group-7");
   assert.equal(harness.texts.length, 1);
   assert.deepEqual(harness.texts[0]?.target, { kind: "group", id: "group-7" });
+  const sentExt = (harness.texts[0]?.ext ?? {}) as Record<string, any>;
+  assert.equal(sentExt?.openclaw?.type, "session_sync_delivery");
+  assert.equal(sentExt?.openclaw?.source, "control_ui_reply");
+  assert.equal(sentExt?.openclaw?.role, "assistant");
+  assert.equal(sentExt?.ai?.role, "ai");
+  assert.equal(sentExt?.ai?.ai_generate, false);
 });
 
 test("group inbound uses mapped subagent session when group mapping points to child session", async () => {
@@ -554,4 +560,11 @@ test("direct router replies still self-loop via router_reply instead of plain ou
   assert.equal(harness.routes[0]?.to, "router:direct:sender-user");
   assert.equal(harness.routerReplies[0]?.to, "sender-user");
   assert.equal(harness.routerReplies[0]?.toType, "roster");
+  const replyExt = JSON.parse(String(harness.routerReplies[0]?.ext ?? "{}")) as Record<string, any>;
+  assert.equal(replyExt?.openclaw?.type, "session_sync_delivery");
+  assert.equal(replyExt?.openclaw?.source, "control_ui_reply");
+  assert.equal(replyExt?.openclaw?.role, "assistant");
+  assert.equal(replyExt?.openclaw?.session, "agent:main:route-session");
+  assert.equal(replyExt?.ai?.role, "ai");
+  assert.equal(replyExt?.ai?.ai_generate, false);
 });

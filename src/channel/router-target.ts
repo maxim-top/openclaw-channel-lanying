@@ -41,15 +41,17 @@ export function buildRouterReplyMessage(params: {
   target: RouterDeliveryTarget;
   text: string;
   timestamp?: number;
+  ext?: Record<string, unknown>;
 }): Record<string, unknown> {
   const timestamp = Number.isFinite(params.timestamp) ? Number(params.timestamp) : Date.now();
+  const extRaw = params.ext && Object.keys(params.ext).length > 0 ? JSON.stringify(params.ext) : "";
   return {
     id: params.id,
     from: params.from,
     to: params.target.id,
     content: params.text,
     type: "text",
-    ext: "",
+    ext: extRaw,
     config: "",
     attach: "",
     status: 1,

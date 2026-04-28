@@ -139,6 +139,7 @@ type MessageFlowContext = {
     target: ClawchatMessageTarget,
     text: string,
     account?: ResolvedClawchatAccount,
+    ext?: Record<string, unknown>,
   ) => Promise<unknown>;
   sendSessionMessageSyncToSelf: (update: {
     sessionFile: string;
@@ -539,7 +540,19 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
           if (!response.trim()) {
             return;
           }
-          await ctx.sendText(params.outboundTarget, response, params.account);
+          await ctx.sendText(params.outboundTarget, response, params.account, {
+            openclaw: {
+              type: "session_sync_delivery",
+              session: persistedSessionKey,
+              source: "control_ui_reply",
+              role: "assistant",
+              request_sid: params.messageId || undefined,
+            },
+            ai: {
+              role: "ai",
+              ai_generate: false,
+            },
+          });
         },
         onError: (err: unknown, info: { kind: "tool" | "block" | "final" }) => {
           logError(`reply dispatcher send failed (kind=${info.kind})`, err);
@@ -1045,6 +1058,20 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
             },
             text: response,
             timestamp: now,
+            ext: {
+              openclaw: {
+                type: "session_sync_delivery",
+                session: persistedSessionKey,
+                source: "control_ui_reply",
+                role: "assistant",
+                message_id: `router_reply_${now}_${replySeq}`,
+                router_request_sid: replyTargetSnapshot.requestSid,
+              },
+              ai: {
+                role: "ai",
+                ai_generate: false,
+              },
+            },
           });
           await ctx.sendRouterReplyToSelf(replyMessage);
           deliveredCount += 1;

@@ -74,6 +74,7 @@ type ClawchatImClient = {
       uid: string;
       content: string;
       ext?: string;
+      extra?: Record<string, unknown>;
       attachment?: unknown;
     }) => Promise<unknown>;
     sendGroupMessage: (params: {
@@ -81,6 +82,7 @@ type ClawchatImClient = {
       gid: string;
       content: string;
       ext?: string;
+      extra?: Record<string, unknown>;
       attachment?: unknown;
     }) => Promise<unknown>;
   };
@@ -396,7 +398,7 @@ class ClawchatSession {
     sendPresetPromptSyncMarkerToSelf: (params) => this.sendPresetPromptSyncMarkerToSelf(params),
     applyOpenClawConfigPatch: (rawPatch) => this.applyOpenClawConfigPatch(rawPatch),
     handlePresetPromptSync: (params) => this.handlePresetPromptSync(params),
-    sendText: (target, text, account) => this.sendText(target, text, account),
+    sendText: (target, text, account, ext) => this.sendText(target, text, account, ext),
     sendSessionMessageSyncToSelf: (update) => this.sendSessionMessageSyncToSelf(update),
     rememberSessionSenderUserId: (params) => this.rememberSessionSenderUserId(params),
     resolveSessionMapping: (params) => this.resolveSessionMapping(params),
@@ -1995,6 +1997,7 @@ class ClawchatSession {
     target: ClawchatMessageTarget,
     text: string,
     account?: ResolvedClawchatAccount,
+    ext?: Record<string, unknown>,
   ): Promise<unknown> {
     const cfgToUse = account ?? this.lastConfig;
     if (!cfgToUse) {
@@ -2005,15 +2008,19 @@ class ClawchatSession {
       throw new Error("ClawChat client is not ready");
     }
 
+    const extRaw = ext && Object.keys(ext).length > 0 ? JSON.stringify(ext) : undefined;
     const payload = {
       type: "text",
       content: text,
+      ext: extRaw,
+      extra: extRaw ? { ext: extRaw } : undefined,
     };
 
     logDebug("sending message", {
       kind: target.kind,
       id: target.id,
       textPreview: text.slice(0, 80),
+      hasExt: Boolean(extRaw),
     });
 
     if (target.kind === "group") {
@@ -2332,7 +2339,17 @@ export const clawchatPlugin: any = {
       if (!target || !target.id) {
         throw new Error(`Invalid ClawChat target: ${to}`);
       }
-      const messageId = await session.sendText(target, text, account);
+      const messageId = await session.sendText(target, text, account, {
+        openclaw: {
+          type: "im_reply_delivery",
+          source: "im_reply",
+          role: "assistant",
+        },
+        ai: {
+          role: "ai",
+          ai_generate: false,
+        },
+      });
       return {
         channel: CLAWCHAT_CHANNEL_ID,
         messageId: String(messageId ?? ""),
