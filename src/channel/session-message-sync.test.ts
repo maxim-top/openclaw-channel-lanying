@@ -99,7 +99,7 @@ test("non-session sync openclaw envelopes are ignored by the sync extractor", ()
   );
 });
 
-test("session mapping signal preserves sender user id", () => {
+test("session mapping signal preserves origin identity fields", () => {
   assert.deepEqual(
     extractSessionMappingSignal(
       {
@@ -112,7 +112,9 @@ test("session mapping signal preserves sender user id", () => {
                 session_key: "agent:main:subagent:child-1",
                 group_id: "session-group-1",
                 openclaw_user_id: "openclaw-user",
-                sender_user_id: "real-user",
+                origin_kind: "im_user",
+                origin_user_id: "real-user",
+                chatbot_user_id: "chatbot-user",
                 parent_session_key: "agent:main:clawchat-router:group:group-1",
                 root_session_key: "agent:main:clawchat-router:group:group-1",
               },
@@ -130,7 +132,9 @@ test("session mapping signal preserves sender user id", () => {
           session: "agent:main:subagent:child-1",
           groupId: "session-group-1",
           openclawUserId: "openclaw-user",
-          senderUserId: "real-user",
+          originKind: "im_user",
+          originUserId: "real-user",
+          chatbotUserId: "chatbot-user",
           parentSessionKey: "agent:main:clawchat-router:group:group-1",
           rootSessionKey: "agent:main:clawchat-router:group:group-1",
           effectiveTargetSessionKey: undefined,

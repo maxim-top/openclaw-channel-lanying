@@ -51,7 +51,6 @@ function createMessageFlowHarness(options?: {
   const routes: Array<Record<string, unknown>> = [];
   const routerReplies: Array<Record<string, unknown>> = [];
   const texts: Array<{ target: unknown; text: string; ext?: Record<string, unknown> }> = [];
-  const rememberedSenders: Array<{ sessionKey: string; senderUserId: string }> = [];
   const seededSyncs: Array<Record<string, unknown>> = [];
   const flow = createClawchatSessionMessageFlow({
     getSelfId: () => "openclaw-user",
@@ -89,9 +88,6 @@ function createMessageFlowHarness(options?: {
     sendSessionMessageSyncToSelf: async (update) => {
       seededSyncs.push(update as Record<string, unknown>);
     },
-    rememberSessionSenderUserId: (params) => {
-      rememberedSenders.push(params);
-    },
     resolveSessionMapping: () =>
       options?.mappedSessionKey ? { sessionKey: options.mappedSessionKey } : null,
     applySessionMappingSignal: () => undefined,
@@ -106,7 +102,6 @@ function createMessageFlowHarness(options?: {
     routes,
     routerReplies,
     texts,
-    rememberedSenders,
     seededSyncs,
   };
 }
@@ -426,11 +421,7 @@ test("router_request keeps origin in execution ctx while sanitizing persisted ma
   assert.equal(harness.routes[0]?.to, "router:group:group-42");
   assert.equal(harness.routerReplies.length, 1);
   assert.equal(harness.texts.length, 0);
-  assert.equal(harness.rememberedSenders.length >= 2, true);
-  assert.deepEqual(
-    harness.rememberedSenders.map((entry) => entry.senderUserId),
-    new Array(harness.rememberedSenders.length).fill("sender-user"),
-  );
+  assert.equal(harness.seededSyncs.length, 0);
 });
 
 for (const [name, rawBody, commandBody] of [
@@ -542,20 +533,10 @@ test("group inbound uses mapped subagent session when group mapping points to ch
   assert.equal(harness.routes.length, 1);
   assert.equal(harness.routes[0]?.sessionKey, "agent:main:subagent:child-7");
   assert.equal(harness.dispatched[0]?.OriginatingTo, "group-7");
-  assert.equal(harness.rememberedSenders.length >= 2, true);
-  assert.deepEqual(
-    harness.rememberedSenders.map((entry) => entry.senderUserId),
-    new Array(harness.rememberedSenders.length).fill("sender-user"),
-  );
-  assert.equal(
-    harness.rememberedSenders.some(
-      (entry) => entry.sessionKey === "agent:main:subagent:child-7",
-    ),
-    true,
-  );
+  assert.equal(harness.seededSyncs.length, 0);
 });
 
-test("direct inbound remembers and seeds the external sender user instead of the OpenClaw user", async () => {
+test("direct inbound seeds the external sender user instead of the OpenClaw user", async () => {
   const harness = createMessageFlowHarness({
     routeSessionKey: "agent:main:clawchat:group:parent-group",
   });
@@ -573,11 +554,6 @@ test("direct inbound remembers and seeds the external sender user instead of the
     createBaseAccount(),
   );
 
-  assert.equal(harness.rememberedSenders.length >= 2, true);
-  assert.deepEqual(
-    harness.rememberedSenders.map((entry) => entry.senderUserId),
-    new Array(harness.rememberedSenders.length).fill("real-user"),
-  );
   assert.equal(harness.seededSyncs.length, 1);
   assert.equal(harness.seededSyncs[0]?.senderUserId, "real-user");
   assert.equal(harness.seededSyncs[0]?.source, "control_ui_user");

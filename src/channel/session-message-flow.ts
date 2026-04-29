@@ -148,7 +148,6 @@ type MessageFlowContext = {
     senderUserId?: string;
     message?: unknown;
   }) => Promise<void>;
-  rememberSessionSenderUserId: (params: { sessionKey: string; senderUserId: string }) => void;
   resolveSessionMapping: (params: {
     appId: string;
     openclawUserId: string;
@@ -502,29 +501,6 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
         });
       },
     });
-
-    const inboundSenderUserId =
-      params.mode === "direct"
-        ? (params.senderId || params.targetId).trim()
-        : (params.senderId || "").trim();
-    if (inboundSenderUserId) {
-        ctx.rememberSessionSenderUserId({
-          sessionKey: persistedSessionKey,
-          senderUserId: inboundSenderUserId,
-        });
-        if (route.sessionKey && route.sessionKey !== persistedSessionKey) {
-          ctx.rememberSessionSenderUserId({
-            sessionKey: route.sessionKey,
-            senderUserId: inboundSenderUserId,
-          });
-        }
-        if (route.mainSessionKey) {
-          ctx.rememberSessionSenderUserId({
-            sessionKey: route.mainSessionKey,
-            senderUserId: inboundSenderUserId,
-          });
-        }
-    }
 
     await maybeSeedParentSessionMapping({
       sessionKey: route.sessionKey,
@@ -1013,26 +989,6 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       updateLastRouteSessionKey,
       messageId: messageSid || undefined,
     });
-
-    const routerInboundSenderUserId = inboundMode === "group" ? fromId : directUserId;
-    if (routerInboundSenderUserId) {
-      ctx.rememberSessionSenderUserId({
-        sessionKey: persistedSessionKey,
-        senderUserId: routerInboundSenderUserId,
-      });
-      if (route.sessionKey && route.sessionKey !== persistedSessionKey) {
-        ctx.rememberSessionSenderUserId({
-          sessionKey: route.sessionKey,
-          senderUserId: routerInboundSenderUserId,
-        });
-      }
-      if (route.mainSessionKey) {
-        ctx.rememberSessionSenderUserId({
-          sessionKey: route.mainSessionKey,
-          senderUserId: routerInboundSenderUserId,
-        });
-      }
-    }
 
     await maybeSeedParentSessionMapping({
       sessionKey: route.sessionKey,

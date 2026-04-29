@@ -366,10 +366,6 @@ class ClawchatSession {
       effectiveTargetSessionKey?: string;
     }
   >();
-  private sessionSenderUserIdBySessionKey = new Map<
-    string,
-    { senderUserId: string; updatedAt: number }
-  >();
   private recentSubagentAssistantReplyByParentSessionKey = new Map<
     string,
     {
@@ -400,7 +396,6 @@ class ClawchatSession {
     handlePresetPromptSync: (params) => this.handlePresetPromptSync(params),
     sendText: (target, text, account, ext) => this.sendText(target, text, account, ext),
     sendSessionMessageSyncToSelf: (update) => this.sendSessionMessageSyncToSelf(update),
-    rememberSessionSenderUserId: (params) => this.rememberSessionSenderUserId(params),
     resolveSessionMapping: (params) => this.resolveSessionMapping(params),
     applySessionMappingSignal: (signal) => this.applySessionMappingSignal(signal),
     pendingGroupContext: this.pendingGroupContext,
@@ -421,36 +416,6 @@ class ClawchatSession {
   private normalizeOptionalSessionKey(value: unknown): string | undefined {
     const normalized = this.normalizeSessionMappingSessionKey(String(value ?? ""));
     return normalized || undefined;
-  }
-
-  private rememberSessionSenderUserId(params: { sessionKey: string; senderUserId: string }): void {
-    const normalizedSessionKey = this.normalizeOptionalSessionKey(params.sessionKey);
-    const senderUserId = String(params.senderUserId ?? "").trim();
-    if (!normalizedSessionKey || !senderUserId) {
-      return;
-    }
-    this.sessionSenderUserIdBySessionKey.set(normalizedSessionKey, {
-      senderUserId,
-      updatedAt: Date.now(),
-    });
-  }
-
-  private resolveRememberedSessionSenderUserId(
-    sessionKey: string,
-    lineage?: { parentSessionKey?: string; rootSessionKey?: string },
-  ): string | undefined {
-    const candidates = [
-      this.normalizeOptionalSessionKey(sessionKey),
-      this.normalizeOptionalSessionKey(lineage?.parentSessionKey),
-      this.normalizeOptionalSessionKey(lineage?.rootSessionKey),
-    ].filter((value): value is string => Boolean(value));
-    for (const candidate of candidates) {
-      const remembered = this.sessionSenderUserIdBySessionKey.get(candidate);
-      if (remembered?.senderUserId) {
-        return remembered.senderUserId;
-      }
-    }
-    return undefined;
   }
 
   private cleanupRecentSubagentAssistantReplies(now = Date.now()): void {
@@ -743,12 +708,6 @@ class ClawchatSession {
           mapping.effectiveTargetSessionKey,
         ),
       });
-      if (mapping.senderUserId?.trim()) {
-        this.rememberSessionSenderUserId({
-          sessionKey,
-          senderUserId: mapping.senderUserId,
-        });
-      }
     }
     if (signal.type === "session_mapping_snapshot") {
       void this.seedMissingSessionMappingsFromLocalStore();
@@ -1619,18 +1578,10 @@ class ClawchatSession {
         lineage: payloadLineage,
       });
     }
-    const rememberedSenderUserId =
+    const observedSenderUserId =
       typeof update.senderUserId === "string" && update.senderUserId.trim()
         ? update.senderUserId.trim()
-        : payloadSessionKey
-          ? this.resolveRememberedSessionSenderUserId(payloadSessionKey, payloadLineage)
-          : undefined;
-    if (payloadSessionKey && rememberedSenderUserId) {
-      this.rememberSessionSenderUserId({
-        sessionKey: payloadSessionKey,
-        senderUserId: rememberedSenderUserId,
-      });
-    }
+        : undefined;
     const normalizedPayload = {
       session: payloadSessionKey,
       ...(typeof update.messageId === "string" && update.messageId.trim()
@@ -1647,8 +1598,8 @@ class ClawchatSession {
           ? { spawn_depth: payloadLineage.spawnDepth }
           : {}),
       ...(normalizedSource ? { source: normalizedSource } : {}),
-      ...(rememberedSenderUserId
-        ? { sender_user_id: rememberedSenderUserId }
+      ...(observedSenderUserId
+        ? { sender_user_id: observedSenderUserId }
         : {}),
       message: message
         ? {
