@@ -503,26 +503,27 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       },
     });
 
-    if (params.mode === "direct") {
-      const directSenderUserId = (params.senderId || params.targetId).trim();
-      if (directSenderUserId) {
+    const inboundSenderUserId =
+      params.mode === "direct"
+        ? (params.senderId || params.targetId).trim()
+        : (params.senderId || "").trim();
+    if (inboundSenderUserId) {
         ctx.rememberSessionSenderUserId({
           sessionKey: persistedSessionKey,
-          senderUserId: directSenderUserId,
+          senderUserId: inboundSenderUserId,
         });
         if (route.sessionKey && route.sessionKey !== persistedSessionKey) {
           ctx.rememberSessionSenderUserId({
             sessionKey: route.sessionKey,
-            senderUserId: directSenderUserId,
+            senderUserId: inboundSenderUserId,
           });
         }
         if (route.mainSessionKey) {
           ctx.rememberSessionSenderUserId({
             sessionKey: route.mainSessionKey,
-            senderUserId: directSenderUserId,
+            senderUserId: inboundSenderUserId,
           });
         }
-      }
     }
 
     await maybeSeedParentSessionMapping({
@@ -1013,21 +1014,22 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       messageId: messageSid || undefined,
     });
 
-    if (inboundMode === "direct" && directUserId) {
+    const routerInboundSenderUserId = inboundMode === "group" ? fromId : directUserId;
+    if (routerInboundSenderUserId) {
       ctx.rememberSessionSenderUserId({
         sessionKey: persistedSessionKey,
-        senderUserId: directUserId,
+        senderUserId: routerInboundSenderUserId,
       });
       if (route.sessionKey && route.sessionKey !== persistedSessionKey) {
         ctx.rememberSessionSenderUserId({
           sessionKey: route.sessionKey,
-          senderUserId: directUserId,
+          senderUserId: routerInboundSenderUserId,
         });
       }
       if (route.mainSessionKey) {
         ctx.rememberSessionSenderUserId({
           sessionKey: route.mainSessionKey,
-          senderUserId: directUserId,
+          senderUserId: routerInboundSenderUserId,
         });
       }
     }

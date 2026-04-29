@@ -426,6 +426,11 @@ test("router_request keeps origin in execution ctx while sanitizing persisted ma
   assert.equal(harness.routes[0]?.to, "router:group:group-42");
   assert.equal(harness.routerReplies.length, 1);
   assert.equal(harness.texts.length, 0);
+  assert.equal(harness.rememberedSenders.length >= 2, true);
+  assert.deepEqual(
+    harness.rememberedSenders.map((entry) => entry.senderUserId),
+    new Array(harness.rememberedSenders.length).fill("sender-user"),
+  );
 });
 
 for (const [name, rawBody, commandBody] of [
@@ -537,6 +542,17 @@ test("group inbound uses mapped subagent session when group mapping points to ch
   assert.equal(harness.routes.length, 1);
   assert.equal(harness.routes[0]?.sessionKey, "agent:main:subagent:child-7");
   assert.equal(harness.dispatched[0]?.OriginatingTo, "group-7");
+  assert.equal(harness.rememberedSenders.length >= 2, true);
+  assert.deepEqual(
+    harness.rememberedSenders.map((entry) => entry.senderUserId),
+    new Array(harness.rememberedSenders.length).fill("sender-user"),
+  );
+  assert.equal(
+    harness.rememberedSenders.some(
+      (entry) => entry.sessionKey === "agent:main:subagent:child-7",
+    ),
+    true,
+  );
 });
 
 test("direct inbound remembers and seeds the external sender user instead of the OpenClaw user", async () => {
