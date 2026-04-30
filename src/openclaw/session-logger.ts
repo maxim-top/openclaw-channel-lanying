@@ -231,7 +231,7 @@ function resolveCurrentMessageUserSyncSourceBasis(
   if (source === "control_ui_user" && isSubagentBootstrapUserTurn(sessionIdentity, message)) {
     return "fallback";
   }
-  return "fallback";
+  return null;
 }
 
 function isSubagentBootstrapUserTurn(
@@ -250,6 +250,21 @@ function isSubagentBootstrapUserTurn(
     normalizedText.includes("[Subagent Task]:") ||
     normalizedText.startsWith("[Subagent Context] You are running as a subagent")
   );
+}
+
+function isInternalRuntimeContextUserTurn(message: Record<string, unknown> | null): boolean {
+  if (!message) {
+    return false;
+  }
+  const visibleText = extractMessageVisibleText(message.content);
+  if (!visibleText) {
+    return false;
+  }
+  const normalizedText = visibleText.trim();
+  const hasRuntimeHeader = normalizedText.includes("OpenClaw runtime context (internal):");
+  const hasPrivateNotice = normalizedText.includes("Keep internal details private.");
+  const hasInternalTaskEvent = normalizedText.includes("[Internal task completion event]");
+  return (hasRuntimeHeader && hasPrivateNotice) || (hasRuntimeHeader && hasInternalTaskEvent);
 }
 
 function shouldLogSubagentBootstrapTranscriptUpdate(update: SessionTranscriptUpdate): boolean {
@@ -465,11 +480,14 @@ function shouldProcessUpdate(update: SessionTranscriptUpdate): boolean {
   if (syncSource !== "control_ui_user" && syncSource !== "control_ui_reply") {
     return false;
   }
+  const message = asPlainObject(update.message);
+  if (syncSource === "control_ui_user" && isInternalRuntimeContextUserTurn(message)) {
+    return false;
+  }
   if (syncSource === "control_ui_user" && shouldSuppressDuplicatedControlUiUser(update)) {
     return false;
   }
   const sessionKey = resolveSessionIdentity(update);
-  const message = asPlainObject(update.message);
   const timestamp = Number(message?.timestamp ?? message?.createdAt ?? 0) || 0;
   const role = normalizeHint(message?.role ?? message?.authorRole);
   const bodyPreview = extractBodyPreview(update.message);
