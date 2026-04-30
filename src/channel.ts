@@ -359,8 +359,11 @@ class ClawchatSession {
   private sessionMappingBySessionKey = new Map<
     string,
     {
+      groupId?: string;
       groupKey?: string;
       updatedAt: number;
+      originKind?: string;
+      originUserId?: string;
       parentSessionKey?: string;
       rootSessionKey?: string;
       effectiveTargetSessionKey?: string;
@@ -641,6 +644,44 @@ class ClawchatSession {
     };
   }
 
+  private resolveObservedOriginFactsFromSessionMapping(sessionKey?: string): {
+    senderUserId: string;
+    fromUserId: string;
+    toId?: string;
+    chatType?: "direct" | "group";
+    channel?: string;
+    messageType: "im_inbound_user";
+  } | null {
+    const normalizedSessionKey = this.normalizeOptionalSessionKey(sessionKey);
+    if (!normalizedSessionKey) {
+      return null;
+    }
+    const entry = this.sessionMappingBySessionKey.get(normalizedSessionKey);
+    const originKind = String(entry?.originKind ?? "").trim();
+    const originUserId = String(entry?.originUserId ?? "").trim();
+    if (!originUserId || (originKind !== "im_user" && originKind !== "direct_user")) {
+      return null;
+    }
+    const channel = normalizedSessionKey.includes(":clawchat-router:")
+      ? "clawchat-router"
+      : normalizedSessionKey.includes(":clawchat:")
+        ? "clawchat"
+        : undefined;
+    const chatType =
+      originKind === "direct_user" || normalizedSessionKey.includes(":direct:")
+        ? "direct"
+        : "group";
+    const toId = chatType === "group" ? entry?.groupId : originUserId;
+    return {
+      senderUserId: originUserId,
+      fromUserId: originUserId,
+      ...(toId ? { toId } : {}),
+      chatType,
+      ...(channel ? { channel } : {}),
+      messageType: "im_inbound_user",
+    };
+  }
+
   private resolveSessionMapping(params: {
     appId: string;
     openclawUserId: string;
@@ -700,8 +741,11 @@ class ClawchatSession {
         this.sessionMappingByGroupKey.set(groupKey, { sessionKey, updatedAt });
       }
       this.sessionMappingBySessionKey.set(normalizedSessionKey, {
+        ...(groupId ? { groupId } : {}),
         ...(groupKey ? { groupKey } : {}),
         updatedAt,
+        originKind: mapping.originKind?.trim(),
+        originUserId: mapping.originUserId?.trim(),
         parentSessionKey: this.normalizeOptionalSessionKey(mapping.parentSessionKey),
         rootSessionKey: this.normalizeOptionalSessionKey(mapping.rootSessionKey),
         effectiveTargetSessionKey: this.normalizeOptionalSessionKey(
@@ -1492,6 +1536,13 @@ class ClawchatSession {
     rootSessionKey?: string;
     spawnDepth?: number;
     senderUserId?: string;
+    observedSenderUserId?: string;
+    observedFromUserId?: string;
+    observedToId?: string;
+    observedChatType?: string;
+    observedChannel?: string;
+    observedMessageType?: string;
+    observedMessageTypeSource?: string;
   }): Promise<void> {
     if (!this.client || !this.selfId || !this.client.isLogin?.()) {
       return;
@@ -1578,10 +1629,66 @@ class ClawchatSession {
         lineage: payloadLineage,
       });
     }
+    const inheritedObservedOriginFacts =
+      payloadSessionKey.includes(":subagent:") &&
+      normalizedSource === "control_ui_user" &&
+      normalizedRole === "user" &&
+      !update.senderUserId?.trim() &&
+      !update.observedSenderUserId?.trim() &&
+      update.observedMessageType === "control_ui_user" &&
+      update.observedMessageTypeSource === "fallback"
+        ? this.resolveObservedOriginFactsFromSessionMapping(payloadLineage.parentSessionKey) ??
+          this.resolveObservedOriginFactsFromSessionMapping(payloadLineage.rootSessionKey)
+        : null;
     const observedSenderUserId =
+      typeof update.observedSenderUserId === "string" && update.observedSenderUserId.trim()
+        ? update.observedSenderUserId.trim()
+        : typeof update.senderUserId === "string" && update.senderUserId.trim()
+          ? update.senderUserId.trim()
+          : inheritedObservedOriginFacts?.senderUserId
+            ? inheritedObservedOriginFacts.senderUserId
+          : undefined;
+    const legacySenderUserId =
       typeof update.senderUserId === "string" && update.senderUserId.trim()
         ? update.senderUserId.trim()
+        : observedSenderUserId;
+    const observedFromUserId =
+      typeof update.observedFromUserId === "string" && update.observedFromUserId.trim()
+        ? update.observedFromUserId.trim()
+        : inheritedObservedOriginFacts?.fromUserId
+          ? inheritedObservedOriginFacts.fromUserId
         : undefined;
+    const observedToId =
+      typeof update.observedToId === "string" && update.observedToId.trim()
+        ? update.observedToId.trim()
+        : inheritedObservedOriginFacts?.toId
+          ? inheritedObservedOriginFacts.toId
+        : undefined;
+    const observedChatType =
+      typeof update.observedChatType === "string" && update.observedChatType.trim()
+        ? update.observedChatType.trim()
+        : inheritedObservedOriginFacts?.chatType
+          ? inheritedObservedOriginFacts.chatType
+        : undefined;
+    const observedChannel =
+      typeof update.observedChannel === "string" && update.observedChannel.trim()
+        ? update.observedChannel.trim()
+        : inheritedObservedOriginFacts?.channel
+          ? inheritedObservedOriginFacts.channel
+        : undefined;
+    const observedMessageType =
+      inheritedObservedOriginFacts?.messageType
+        ? inheritedObservedOriginFacts.messageType
+        : typeof update.observedMessageType === "string" && update.observedMessageType.trim()
+        ? update.observedMessageType.trim()
+        : undefined;
+    const observedMessageTypeSource =
+      inheritedObservedOriginFacts?.messageType
+        ? "inherited_mapping"
+        : typeof update.observedMessageTypeSource === "string" &&
+            update.observedMessageTypeSource.trim()
+          ? update.observedMessageTypeSource.trim()
+          : undefined;
     const normalizedPayload = {
       session: payloadSessionKey,
       ...(typeof update.messageId === "string" && update.messageId.trim()
@@ -1598,8 +1705,17 @@ class ClawchatSession {
           ? { spawn_depth: payloadLineage.spawnDepth }
           : {}),
       ...(normalizedSource ? { source: normalizedSource } : {}),
-      ...(observedSenderUserId
-        ? { sender_user_id: observedSenderUserId }
+      ...(legacySenderUserId
+        ? { sender_user_id: legacySenderUserId }
+        : {}),
+      ...(observedSenderUserId ? { observed_sender_user_id: observedSenderUserId } : {}),
+      ...(observedFromUserId ? { observed_from_user_id: observedFromUserId } : {}),
+      ...(observedToId ? { observed_to_id: observedToId } : {}),
+      ...(observedChatType ? { observed_chat_type: observedChatType } : {}),
+      ...(observedChannel ? { observed_channel: observedChannel } : {}),
+      ...(observedMessageType ? { observed_message_type: observedMessageType } : {}),
+      ...(observedMessageTypeSource
+        ? { observed_message_type_source: observedMessageTypeSource }
         : {}),
       message: message
         ? {
@@ -2068,6 +2184,13 @@ export async function emitSessionMessageSyncToSelf(update: {
   messageId?: string;
   source?: string;
   senderUserId?: string;
+  observedSenderUserId?: string;
+  observedFromUserId?: string;
+  observedToId?: string;
+  observedChatType?: string;
+  observedChannel?: string;
+  observedMessageType?: string;
+  observedMessageTypeSource?: string;
 }): Promise<void> {
   await session.sendSessionMessageSyncToSelf(update);
 }

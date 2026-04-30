@@ -58,6 +58,8 @@ test("subagent bootstrap user turn is observed and forwarded as control_ui_user"
   harness.dispose();
   assert.equal(harness.forwarded.length, 1);
   assert.equal(harness.forwarded[0]?.source, "control_ui_user");
+  assert.equal(harness.forwarded[0]?.observedMessageType, "control_ui_user");
+  assert.equal(harness.forwarded[0]?.observedMessageTypeSource, "provenance");
 });
 
 test("normal control UI user turns still forward", async () => {
@@ -78,6 +80,26 @@ test("normal control UI user turns still forward", async () => {
   harness.dispose();
   assert.equal(harness.forwarded.length, 1);
   assert.equal(harness.forwarded[0]?.source, "control_ui_user");
+});
+
+test("subagent bootstrap without provenance is marked as fallback control_ui_user", async () => {
+  const harness = installForwardCollector();
+
+  harness.emit({
+    sessionFile: "agent:main:subagent:child-without-provenance",
+    messageId: "bootstrap-fallback-1",
+    message: {
+      role: "user",
+      content:
+        "[Subagent Context] You are running as a subagent (depth 1/1).\n\n[Subagent Task]: question from inherited IM session",
+    },
+  });
+
+  harness.dispose();
+  assert.equal(harness.forwarded.length, 1);
+  assert.equal(harness.forwarded[0]?.source, "control_ui_user");
+  assert.equal(harness.forwarded[0]?.observedMessageType, "control_ui_user");
+  assert.equal(harness.forwarded[0]?.observedMessageTypeSource, "fallback");
 });
 
 test("normal control UI user and assistant turns both forward to IM", async () => {

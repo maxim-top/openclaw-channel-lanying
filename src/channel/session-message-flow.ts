@@ -146,6 +146,12 @@ type MessageFlowContext = {
     sessionKey?: string;
     source?: string;
     senderUserId?: string;
+    observedSenderUserId?: string;
+    observedFromUserId?: string;
+    observedToId?: string;
+    observedChatType?: "direct" | "group" | string;
+    observedChannel?: string;
+    observedMessageType?: string;
     message?: unknown;
   }) => Promise<void>;
   resolveSessionMapping: (params: {
@@ -212,6 +218,11 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
   async function maybeSeedParentSessionMapping(params: {
     sessionKey: string;
     senderUserId?: string;
+    fromUserId?: string;
+    toId?: string;
+    chatType?: "direct" | "group";
+    channel?: string;
+    messageType?: string;
     mappedSessionKey?: string | null;
   }): Promise<void> {
     const senderUserId = params.senderUserId?.trim() || "";
@@ -223,6 +234,12 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       sessionKey: params.sessionKey,
       source: "control_ui_user",
       senderUserId,
+      observedSenderUserId: senderUserId,
+      observedFromUserId: params.fromUserId?.trim() || senderUserId,
+      observedToId: params.toId?.trim() || undefined,
+      observedChatType: params.chatType,
+      observedChannel: params.channel,
+      observedMessageType: params.messageType,
       message: {
         role: "user",
         content: "",
@@ -505,6 +522,11 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
     await maybeSeedParentSessionMapping({
       sessionKey: route.sessionKey,
       senderUserId: params.mode === "direct" ? params.senderId || params.targetId : params.senderId,
+      fromUserId: params.senderId || undefined,
+      toId: params.targetId,
+      chatType: params.mode,
+      channel: CLAWCHAT_CHANNEL_ID,
+      messageType: "im_inbound_user",
       mappedSessionKey,
     });
 
@@ -993,6 +1015,11 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
     await maybeSeedParentSessionMapping({
       sessionKey: route.sessionKey,
       senderUserId: inboundMode === "group" ? fromId || undefined : directUserId || undefined,
+      fromUserId: fromId || undefined,
+      toId: inboundMode === "group" ? routerGroupId || replyTo || toId || undefined : inboundPeerId,
+      chatType: inboundMode,
+      channel: CLAWCHAT_ROUTER_CHANNEL_ID,
+      messageType: "im_inbound_user",
       mappedSessionKey,
     });
 

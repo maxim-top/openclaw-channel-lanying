@@ -32,6 +32,8 @@ type SessionTranscriptUpdate = {
   message?: unknown;
   messageId?: string;
   source?: SessionMessageSyncSource;
+  observedMessageType?: string;
+  observedMessageTypeSource?: string;
 };
 
 type SessionLoggerSnapshot = {
@@ -192,6 +194,44 @@ function resolveCurrentMessageUserSyncSource(
     }
   }
   return null;
+}
+
+function resolveCurrentMessageUserSyncSourceBasis(
+  sessionIdentity: string,
+  message: Record<string, unknown> | null,
+  source: SessionMessageSyncSource | null,
+): string | null {
+  if (!source || !message) {
+    return null;
+  }
+  const provenanceCandidates = [
+    asPlainObject(message.provenance),
+    asPlainObject(message.InputProvenance),
+  ];
+  for (const provenance of provenanceCandidates) {
+    if (!provenance) {
+      continue;
+    }
+    const sourceChannel = normalizeHint(provenance.sourceChannel);
+    const sourceTool = normalizeHint(provenance.sourceTool);
+    if (
+      sourceChannel === "webchat" ||
+      hasClawchatChannelHint(sourceChannel) ||
+      sourceTool.includes("clawchat") ||
+      sourceTool.includes("lanying") ||
+      sourceChannel ||
+      sourceTool
+    ) {
+      return "provenance";
+    }
+  }
+  if (source === "im_inbound_user" && messageLooksLikeClawchatInbound(message)) {
+    return "message_hint";
+  }
+  if (source === "control_ui_user" && isSubagentBootstrapUserTurn(sessionIdentity, message)) {
+    return "fallback";
+  }
+  return "fallback";
 }
 
 function isSubagentBootstrapUserTurn(
@@ -559,9 +599,9 @@ export function installGlobalOpenClawSessionLogger(
       listener: (update: SessionTranscriptUpdate) => void,
     ) => () => void
   )((update) => {
+    const message = asPlainObject(update.message);
     if (shouldLogSubagentBootstrapTranscriptUpdate(update)) {
       const sessionIdentity = resolveSessionIdentity(update);
-      const message = asPlainObject(update.message);
       logDebug("subagent bootstrap transcript update observed", {
         session: sessionIdentity,
         messageId: update.messageId,
@@ -573,7 +613,25 @@ export function installGlobalOpenClawSessionLogger(
     if (!shouldProcessUpdate(update)) {
       return;
     }
-    const nextUpdate = source ? { ...update, source } : update;
+    const nextUpdate = source
+      ? {
+          ...update,
+          source,
+          ...(source === "control_ui_user" ? { observedMessageType: "control_ui_user" } : {}),
+          ...(source === "control_ui_reply" ? { observedMessageType: "control_ui_reply" } : {}),
+          ...(source === "im_inbound_user" ? { observedMessageType: "im_inbound_user" } : {}),
+          ...(source === "im_inbound_reply" ? { observedMessageType: "im_inbound_reply" } : {}),
+          ...(normalizeHint(message?.role ?? message?.authorRole) === "user"
+            ? {
+                observedMessageTypeSource: resolveCurrentMessageUserSyncSourceBasis(
+                  resolveSessionIdentity(update),
+                  message,
+                  source,
+                ) ?? undefined,
+              }
+            : {}),
+        }
+      : update;
     rememberSnapshot(nextUpdate);
     void options.onSessionTranscriptUpdate?.(nextUpdate);
   });

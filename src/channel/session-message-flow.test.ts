@@ -556,6 +556,12 @@ test("direct inbound seeds the external sender user instead of the OpenClaw user
 
   assert.equal(harness.seededSyncs.length, 1);
   assert.equal(harness.seededSyncs[0]?.senderUserId, "real-user");
+  assert.equal(harness.seededSyncs[0]?.observedSenderUserId, "real-user");
+  assert.equal(harness.seededSyncs[0]?.observedFromUserId, "real-user");
+  assert.equal(harness.seededSyncs[0]?.observedToId, "real-user");
+  assert.equal(harness.seededSyncs[0]?.observedChatType, "direct");
+  assert.equal(harness.seededSyncs[0]?.observedChannel, "clawchat");
+  assert.equal(harness.seededSyncs[0]?.observedMessageType, "im_inbound_user");
   assert.equal(harness.seededSyncs[0]?.source, "control_ui_user");
 });
 
