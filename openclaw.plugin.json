@@ -1,6 +1,57 @@
 {
   "id": "clawchat",
   "channels": ["clawchat"],
+  "channelConfigs": {
+    "clawchat": {
+      "label": "ClawChat",
+      "description": "ClawChat IM channel for OpenClaw.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "enable": { "type": "boolean" },
+          "appId": { "type": "string" },
+          "app_id": { "type": "string" },
+          "username": { "type": "string" },
+          "password": { "type": "string" },
+          "allowManage": { "type": "boolean" },
+          "dmPolicy": { "type": "string" },
+          "allowFrom": {
+            "type": "array",
+            "items": {
+              "type": ["string", "number"]
+            }
+          },
+          "groupPolicy": { "type": "string" },
+          "groupAllowFrom": {
+            "type": "array",
+            "items": {
+              "type": ["string", "number"]
+            }
+          },
+          "groups": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "requireMention": { "type": "boolean" },
+                "enabled": { "type": "boolean" },
+                "allowFrom": {
+                  "type": "array",
+                  "items": {
+                    "type": ["string", "number"]
+                  }
+                }
+              }
+            }
+          },
+          "defaultTo": { "type": "string" }
+        }
+      }
+    }
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

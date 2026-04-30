@@ -118,6 +118,20 @@ const sdkModulePath = path.resolve(
 let cachedFlooFactory: FlooFactory | null = null;
 const READY_TIMEOUT_MS = 15_000;
 const READY_POLL_MS = 250;
+
+export function buildClawchatClientOptions(account: ResolvedClawchatAccount): Record<string, unknown> {
+  return {
+    appid: account.appId,
+    // In OpenClaw's Node runtime the SDK must stay on the Node websocket path.
+    // Falling back to polling/browser transport semantics is what previously
+    // broke login readiness after OpenClaw upgrades.
+    ws: true,
+    forceNode: true,
+    transports: ["websocket"],
+    autoLogin: false,
+    logLevel: "off",
+  };
+}
 const RECONNECT_BASE_DELAY_MS = 2_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const CONFIG_PATCH_RETRY_MAX = 3;
@@ -1295,12 +1309,7 @@ class ClawchatSession {
 
   private async createClient(account: ResolvedClawchatAccount): Promise<ClawchatImClient> {
     const flooFactory = loadFlooFactory();
-    const im = flooFactory({
-      appid: account.appId,
-      ws: true,
-      autoLogin: false,
-      logLevel: "off",
-    });
+    const im = flooFactory(buildClawchatClientOptions(account));
     logDebug("im client created", { appId: `${account.appId.slice(0, 4)}***` });
     return im;
   }
