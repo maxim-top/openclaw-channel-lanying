@@ -26,6 +26,10 @@ export type ClawchatChannelConfig = {
   groupAllowFrom?: Array<string | number>;
   groups?: Record<string, ClawchatGroupConfig | undefined>;
   defaultTo?: string;
+  sessionMapSync?: boolean;
+  session_map_sync?: boolean;
+  mergeSubSessions?: boolean;
+  merge_sub_sessions?: boolean;
 };
 
 export type ResolvedClawchatAccount = {
@@ -51,6 +55,8 @@ export type ResolvedClawchatAccount = {
     }
   >;
   defaultTo?: string;
+  sessionMapSync: boolean;
+  mergeSubSessions: boolean;
 };
 
 export type ClawchatMessageTarget = {

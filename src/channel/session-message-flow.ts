@@ -2,6 +2,7 @@ import { logDebug, logError, logWarn } from "../shared/logging.js";
 import {
   extractConfigPatchRaw,
   extractPresetPromptSync,
+  extractSessionMapSettingsSync,
   extractRouterSignal,
   extractSessionMappingSignal,
   extractSessionSyncDeliverySignal,
@@ -14,6 +15,7 @@ import {
   resolveRouterReplyTargetSnapshot,
   type PresetPromptSyncPayload,
   type RouterReplyTargetSnapshot,
+  type SessionMapSettingsPayload,
   type SessionMappingSignal,
 } from "./message.js";
 import {
@@ -128,6 +130,10 @@ type MessageFlowContext = {
     chatbotName: string;
     prompt: string;
   }) => Promise<void>;
+  sendSessionMapSettingsReportToSelf: (params: {
+    sessionMapSync: boolean;
+    mergeSubSessions: boolean;
+  }) => Promise<void>;
   applyOpenClawConfigPatch: (rawPatch: string) => Promise<void>;
   handlePresetPromptSync: (params: {
     cfg: OpenClawConfig;
@@ -135,6 +141,11 @@ type MessageFlowContext = {
     chatbotName: string;
     prompt: string;
   }) => Promise<void>;
+  handleSessionMapSettingsSync: (params: {
+    cfg: OpenClawConfig;
+    settings: SessionMapSettingsPayload;
+  }) => Promise<void>;
+  isSessionMapSyncEnabled: (cfg: OpenClawConfig) => boolean;
   sendText: (
     target: ClawchatMessageTarget,
     text: string,
@@ -314,11 +325,19 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
   }
 
   function resolveInboundMappedSessionKey(params: {
+    cfg: OpenClawConfig;
     appId: string;
     mode: "direct" | "group";
     targetId: string;
   }): string | null {
     if (params.mode !== "group") {
+      return null;
+    }
+    if (!ctx.isSessionMapSyncEnabled(params.cfg)) {
+      logDebug("session mapping lookup skipped: session_map_sync disabled", {
+        appId: params.appId,
+        groupId: params.targetId,
+      });
       return null;
     }
     const openclawUserId = ctx.getSelfId().trim();
@@ -371,6 +390,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       },
     });
     const mappedSessionKey = resolveInboundMappedSessionKey({
+      cfg: params.cfg,
       appId: params.account.appId,
       mode: params.mode,
       targetId: params.targetId,
@@ -845,6 +865,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
     const mappedSessionKey =
       inboundMode === "group"
         ? resolveInboundMappedSessionKey({
+            cfg,
             appId: account.appId,
             mode: "group",
             targetId: inboundPeerId,
@@ -1141,6 +1162,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       const selfId = ctx.getSelfId();
       const configPatchRaw = extractConfigPatchRaw(eventAny, meta);
       const presetPromptSync = extractPresetPromptSync(eventAny, meta);
+      const sessionMapSettingsSync = extractSessionMapSettingsSync(eventAny, meta);
       const routerSignal = extractRouterSignal(eventAny, meta);
       const sessionMappingSignal = extractSessionMappingSignal(eventAny, meta);
       const sessionSyncDeliverySignal = extractSessionSyncDeliverySignal(eventAny, meta);
@@ -1266,9 +1288,54 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
           }
           return;
         }
+        if (isSelfLoopback && account.allowManage && sessionMapSettingsSync) {
+          if (!isCommandOuterMessage(eventAny, meta)) {
+            logDebug("skip loopback session_map_settings_sync: outer type is not command", {
+              senderId,
+              toId: toIdRaw,
+              selfId,
+            });
+            return;
+          }
+          try {
+            const cfg = await ctx.loadConfig();
+            await ctx.handleSessionMapSettingsSync({
+              cfg,
+              settings: sessionMapSettingsSync,
+            });
+            await ctx.sendSessionMapSettingsReportToSelf(sessionMapSettingsSync);
+            logDebug("processed session_map_settings_sync from self loopback message", {
+              senderId,
+              toId: toIdRaw,
+              selfId,
+              sessionMapSync: sessionMapSettingsSync.sessionMapSync,
+              mergeSubSessions: sessionMapSettingsSync.mergeSubSessions,
+            });
+          } catch (err) {
+            logError("failed to process session_map_settings_sync from self loopback message", {
+              err,
+              senderId,
+              toId: toIdRaw,
+              selfId,
+              sessionMapSync: sessionMapSettingsSync.sessionMapSync,
+              mergeSubSessions: sessionMapSettingsSync.mergeSubSessions,
+            });
+          }
+          return;
+        }
         if (isSelfLoopback && sessionMappingSignal) {
           if (!isCommandOuterMessage(eventAny, meta)) {
             logDebug("skip loopback session_mapping signal: outer type is not command", {
+              senderId,
+              toId: toIdRaw,
+              selfId,
+              signalType: sessionMappingSignal.type,
+            });
+            return;
+          }
+          const cfg = await ctx.loadConfig();
+          if (!ctx.isSessionMapSyncEnabled(cfg)) {
+            logDebug("skip loopback session_mapping signal: session_map_sync disabled", {
               senderId,
               toId: toIdRaw,
               selfId,

@@ -27,6 +27,8 @@ function createBaseAccount(): ResolvedClawchatAccount {
         allowFrom: ["*"],
       },
     },
+    sessionMapSync: true,
+    mergeSubSessions: false,
   };
 }
 
@@ -45,6 +47,7 @@ function createBaseRoute(sessionKey = "agent:main:route-session") {
 function createMessageFlowHarness(options?: {
   mappedSessionKey?: string | null;
   routeSessionKey?: string;
+  cfg?: OpenClawConfig;
 }) {
   const recorded: Array<Record<string, unknown>> = [];
   const dispatched: Array<Record<string, unknown>> = [];
@@ -52,11 +55,20 @@ function createMessageFlowHarness(options?: {
   const routerReplies: Array<Record<string, unknown>> = [];
   const texts: Array<{ target: unknown; text: string; ext?: Record<string, unknown> }> = [];
   const seededSyncs: Array<Record<string, unknown>> = [];
+  const handledSessionMapSettingsSync: Array<Record<string, unknown>> = [];
+  const reportedSessionMapSettings: Array<Record<string, unknown>> = [];
   const flow = createClawchatSessionMessageFlow({
     getSelfId: () => "openclaw-user",
     updateSelfIdFromClient: () => undefined,
     getReadOnlyClient: () => null,
-    loadConfig: async () => ({} as OpenClawConfig),
+    loadConfig: async () =>
+      ((options?.cfg ?? {
+        channels: {
+          clawchat: {
+            sessionMapSync: true,
+          },
+        },
+      }) as OpenClawConfig),
     resolveAgentRoute: () => createBaseRoute(options?.routeSessionKey),
     resolveStorePath: () => "/tmp/mock-sessions.json",
     readSessionUpdatedAt: () => undefined,
@@ -79,8 +91,16 @@ function createMessageFlowHarness(options?: {
     },
     sendConfigPatchMarkerToSelf: async () => undefined,
     sendPresetPromptSyncMarkerToSelf: async () => undefined,
+    sendSessionMapSettingsReportToSelf: async (params) => {
+      reportedSessionMapSettings.push(params as Record<string, unknown>);
+    },
     applyOpenClawConfigPatch: async () => undefined,
     handlePresetPromptSync: async () => undefined,
+    handleSessionMapSettingsSync: async (params) => {
+      handledSessionMapSettingsSync.push(params as Record<string, unknown>);
+    },
+    isSessionMapSyncEnabled: (cfg) =>
+      Boolean(cfg?.channels?.clawchat?.sessionMapSync || cfg?.channels?.clawchat?.session_map_sync),
     sendText: async (target, text, _account, ext) => {
       texts.push({ target, text, ext: ext as Record<string, unknown> | undefined });
       return "msg-1";
@@ -103,6 +123,8 @@ function createMessageFlowHarness(options?: {
     routerReplies,
     texts,
     seededSyncs,
+    handledSessionMapSettingsSync,
+    reportedSessionMapSettings,
   };
 }
 
@@ -238,6 +260,100 @@ test("non-command inbound keeps normal processing even when ext carries session_
   assert.equal(harness.recorded.length, 1);
   assert.equal(harness.dispatched.length, 1);
   assert.equal(harness.texts.length, 1);
+});
+
+test("group inbound uses mapped session only when session_map_sync is enabled", async () => {
+  const disabledHarness = createMessageFlowHarness({
+    mappedSessionKey: "agent:main:mapped-session",
+    routeSessionKey: "agent:main:route-session",
+    cfg: {
+      channels: {
+        clawchat: {
+          sessionMapSync: false,
+        },
+      },
+    } as OpenClawConfig,
+  });
+  await disabledHarness.flow.onInbound(
+    {
+      id: "group-disabled-1",
+      from: "user-1",
+      to: "group-1",
+      toType: "group",
+      type: "text",
+      content: "hello",
+      config: { mentionList: [], senderNickname: "u1" },
+      timestamp: 1004,
+    },
+    "group",
+    createBaseAccount(),
+  );
+  assert.equal(disabledHarness.recorded[0]?.SessionKey, "agent:main:route-session");
+
+  const enabledHarness = createMessageFlowHarness({
+    mappedSessionKey: "agent:main:mapped-session",
+    routeSessionKey: "agent:main:route-session",
+    cfg: {
+      channels: {
+        clawchat: {
+          sessionMapSync: true,
+        },
+      },
+    } as OpenClawConfig,
+  });
+  await enabledHarness.flow.onInbound(
+    {
+      id: "group-enabled-1",
+      from: "user-1",
+      to: "group-1",
+      toType: "group",
+      type: "text",
+      content: "hello",
+      config: { mentionList: [], senderNickname: "u1" },
+      timestamp: 1005,
+    },
+    "group",
+    createBaseAccount(),
+  );
+  assert.equal(enabledHarness.recorded[0]?.SessionKey, "agent:main:mapped-session");
+});
+
+test("self loopback session_map_settings_sync command is consumed and reported", async () => {
+  const harness = createMessageFlowHarness();
+
+  await harness.flow.onInbound(
+    {
+      id: "settings-sync-1",
+      from: "openclaw-user",
+      to: "openclaw-user",
+      type: "command",
+      toType: "roster",
+      content: "",
+      ext: JSON.stringify({
+        openclaw: {
+          type: "session_map_settings_sync",
+          settings: {
+            session_map_sync: "on",
+            merge_sub_sessions: "on",
+          },
+        },
+      }),
+      timestamp: 1006,
+    },
+    "direct",
+    createBaseAccount(),
+  );
+
+  assert.equal(harness.handledSessionMapSettingsSync.length, 1);
+  assert.deepEqual(harness.handledSessionMapSettingsSync[0]?.settings, {
+    sessionMapSync: true,
+    mergeSubSessions: true,
+  });
+  assert.deepEqual(harness.reportedSessionMapSettings[0], {
+    sessionMapSync: true,
+    mergeSubSessions: true,
+  });
+  assert.equal(harness.dispatched.length, 0);
 });
 
 test("self-sent direct text delivery is not dispatched back into OpenClaw", async () => {

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  extractSessionMapSettingsSync,
   extractSessionMappingSignal,
   extractSessionMessageSyncSignal,
   extractSessionSyncDeliverySignal,
@@ -141,6 +142,52 @@ test("session mapping signal preserves origin identity fields", () => {
           updatedAt: undefined,
         },
       ],
+    },
+  );
+});
+
+test("session_map_settings_sync parses parent and child toggles", () => {
+  assert.deepEqual(
+    extractSessionMapSettingsSync(
+      {
+        type: "command",
+        ext: JSON.stringify({
+          openclaw: {
+            type: "session_map_settings_sync",
+            settings: {
+              session_map_sync: "on",
+              merge_sub_sessions: "on",
+            },
+          },
+        }),
+      },
+      {},
+    ),
+    {
+      sessionMapSync: true,
+      mergeSubSessions: true,
+    },
+  );
+
+  assert.deepEqual(
+    extractSessionMapSettingsSync(
+      {
+        type: "command",
+        ext: JSON.stringify({
+          openclaw: {
+            type: "session_map_settings_sync",
+            settings: {
+              session_map_sync: "off",
+              merge_sub_sessions: "on",
+            },
+          },
+        }),
+      },
+      {},
+    ),
+    {
+      sessionMapSync: false,
+      mergeSubSessions: false,
     },
   );
 });

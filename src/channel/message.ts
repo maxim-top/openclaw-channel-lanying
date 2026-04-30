@@ -8,6 +8,11 @@ export type PresetPromptSyncPayload = {
   prompt: string;
 };
 
+export type SessionMapSettingsPayload = {
+  sessionMapSync: boolean;
+  mergeSubSessions: boolean;
+};
+
 export type RouterSignal =
   | {
       type: "router_context";
@@ -177,6 +182,49 @@ export function extractPresetPromptSync(
       chatbotId: String(openclawObj.chatbotId ?? "").trim(),
       chatbotName: String(openclawObj.chatbotName ?? "").trim(),
       prompt: typeof openclawObj.prompt === "string" ? openclawObj.prompt : "",
+    };
+  }
+  return null;
+}
+
+export function extractSessionMapSettingsSync(
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+): SessionMapSettingsPayload | null {
+  const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
+  const extObjCandidates = [
+    parseExtValue(eventAny.ext),
+    parseExtValue(meta.ext),
+    parseExtValue(payload?.ext),
+  ].filter(Boolean) as Record<string, unknown>[];
+
+  for (const extObj of extObjCandidates) {
+    const openclaw = extObj.openclaw;
+    if (!openclaw || typeof openclaw !== "object" || Array.isArray(openclaw)) {
+      continue;
+    }
+    const openclawObj = openclaw as Record<string, unknown>;
+    if (String(openclawObj.type ?? "").trim() !== "session_map_settings_sync") {
+      continue;
+    }
+    const settings =
+      openclawObj.settings && typeof openclawObj.settings === "object" && !Array.isArray(openclawObj.settings)
+        ? (openclawObj.settings as Record<string, unknown>)
+        : openclawObj;
+    const sessionMapSync =
+      settings.sessionMapSync === true ||
+      settings.session_map_sync === true ||
+      String(settings.sessionMapSync ?? settings.session_map_sync ?? "").trim().toLowerCase() === "on";
+    const mergeSubSessions =
+      sessionMapSync &&
+      (
+        settings.mergeSubSessions === true ||
+        settings.merge_sub_sessions === true ||
+        String(settings.mergeSubSessions ?? settings.merge_sub_sessions ?? "").trim().toLowerCase() === "on"
+      );
+    return {
+      sessionMapSync,
+      mergeSubSessions,
     };
   }
   return null;

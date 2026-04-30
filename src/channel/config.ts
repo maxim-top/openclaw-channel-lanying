@@ -245,6 +245,8 @@ export function sanitizeAccountForLog(account: ResolvedClawchatAccount): Record<
     groupPolicy: account.groupPolicy,
     groupAllowFromCount: account.groupAllowFrom.length,
     groupsCount: Object.keys(account.groups).length,
+    sessionMapSync: account.sessionMapSync,
+    mergeSubSessions: account.mergeSubSessions,
   };
 }
 
@@ -295,6 +297,11 @@ export function resolveClawchatAccount(cfg: OpenClawConfig): ResolvedClawchatAcc
   const groupAllowFrom = (channelCfg.groupAllowFrom ?? [])
     .map((entry) => String(entry).trim())
     .filter(Boolean);
+  const sessionMapSync =
+    channelCfg.sessionMapSync === true || channelCfg.session_map_sync === true;
+  const mergeSubSessions =
+    sessionMapSync &&
+    (channelCfg.mergeSubSessions === true || channelCfg.merge_sub_sessions === true);
   const groupsRaw = channelCfg.groups;
   const groups: ResolvedClawchatAccount["groups"] = {};
   if (groupsRaw && typeof groupsRaw === "object" && !Array.isArray(groupsRaw)) {
@@ -336,5 +343,7 @@ export function resolveClawchatAccount(cfg: OpenClawConfig): ResolvedClawchatAcc
     groupAllowFrom,
     groups,
     defaultTo: channelCfg.defaultTo?.trim() || undefined,
+    sessionMapSync,
+    mergeSubSessions,
   };
 }
