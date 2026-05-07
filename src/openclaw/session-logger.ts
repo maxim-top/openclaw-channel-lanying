@@ -79,6 +79,20 @@ function normalizeHint(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
+function normalizeSessionIdentity(value: unknown): string {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized.startsWith("agent:main:router:")) {
+    return `agent:main:clawchat-router:${normalized.slice("agent:main:router:".length)}`;
+  }
+  if (normalized.startsWith("agent:main:group:") && normalized.slice("agent:main:group:".length).trim()) {
+    return `agent:main:clawchat:group:${normalized.slice("agent:main:group:".length).trim()}`;
+  }
+  if (normalized.startsWith("agent:main:") && /^\d+$/.test(normalized.slice("agent:main:".length))) {
+    return `agent:main:clawchat:direct:${normalized.slice("agent:main:".length)}`;
+  }
+  return normalized;
+}
+
 function isSupportedSyncSource(value: unknown): value is SessionMessageSyncSource {
   return (
     value === "control_ui_user" ||
@@ -89,7 +103,7 @@ function isSupportedSyncSource(value: unknown): value is SessionMessageSyncSourc
 }
 
 function resolveSessionIdentity(update: SessionTranscriptUpdate): string {
-  return (pickId(update.sessionKey) || update.sessionFile || "").trim().toLowerCase();
+  return normalizeSessionIdentity(pickId(update.sessionKey) || update.sessionFile || "");
 }
 
 function hasClawchatChannelHint(value: unknown): boolean {
@@ -618,8 +632,8 @@ export function installGlobalOpenClawSessionLogger(
     ) => () => void
   )((update) => {
     const message = asPlainObject(update.message);
+    const sessionIdentity = resolveSessionIdentity(update);
     if (shouldLogSubagentBootstrapTranscriptUpdate(update)) {
-      const sessionIdentity = resolveSessionIdentity(update);
       logDebug("subagent bootstrap transcript update observed", {
         session: sessionIdentity,
         messageId: update.messageId,
@@ -634,6 +648,7 @@ export function installGlobalOpenClawSessionLogger(
     const nextUpdate = source
       ? {
           ...update,
+          sessionKey: sessionIdentity,
           source,
           ...(source === "control_ui_user" ? { observedMessageType: "control_ui_user" } : {}),
           ...(source === "control_ui_reply" ? { observedMessageType: "control_ui_reply" } : {}),

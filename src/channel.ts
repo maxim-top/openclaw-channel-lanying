@@ -463,7 +463,17 @@ class ClawchatSession {
   }
 
   private normalizeSessionMappingSessionKey(sessionKey: string): string {
-    return sessionKey.trim().toLowerCase();
+    const normalized = sessionKey.trim().toLowerCase();
+    if (normalized.startsWith("agent:main:router:")) {
+      return `agent:main:clawchat-router:${normalized.slice("agent:main:router:".length)}`;
+    }
+    if (normalized.startsWith("agent:main:group:") && normalized.slice("agent:main:group:".length).trim()) {
+      return `agent:main:clawchat:group:${normalized.slice("agent:main:group:".length).trim()}`;
+    }
+    if (normalized.startsWith("agent:main:") && /^\d+$/.test(normalized.slice("agent:main:".length))) {
+      return `agent:main:clawchat:direct:${normalized.slice("agent:main:".length)}`;
+    }
+    return normalized;
   }
 
   private normalizeOptionalSessionKey(value: unknown): string | undefined {

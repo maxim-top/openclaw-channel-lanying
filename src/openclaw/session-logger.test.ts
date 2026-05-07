@@ -191,6 +191,108 @@ test("assistant reply after internal runtime context still forwards to IM", asyn
   );
 });
 
+test("legacy router session keys are treated as clawchat-router sessions", async () => {
+  const harness = installForwardCollector();
+
+  harness.emit({
+    sessionFile: "agent:main:router:group:6726580510113",
+    messageId: "legacy-router-user-1",
+    message: {
+      role: "user",
+      content: "legacy router key should still sync",
+      provenance: {
+        sourceChannel: "webchat",
+      },
+    },
+  });
+  harness.emit({
+    sessionFile: "agent:main:router:group:6726580510113",
+    messageId: "legacy-router-assistant-1",
+    message: {
+      role: "assistant",
+      content: "legacy router assistant reply should still sync",
+    },
+  });
+
+  harness.dispose();
+  assert.deepEqual(
+    harness.forwarded.map((update) => [update.sessionKey, update.source]),
+    [
+      ["agent:main:clawchat-router:group:6726580510113", "control_ui_user"],
+      ["agent:main:clawchat-router:group:6726580510113", "control_ui_reply"],
+    ],
+  );
+});
+
+test("legacy agent main clawchat group and direct session keys are canonicalized before forwarding", async () => {
+  const harness = installForwardCollector();
+
+  harness.emit({
+    sessionFile: "agent:main:group:6726580510113",
+    messageId: "legacy-clawchat-group-user-1",
+    message: {
+      role: "user",
+      content: "legacy group key should still sync",
+      provenance: {
+        sourceChannel: "webchat",
+      },
+    },
+  });
+  harness.emit({
+    sessionFile: "agent:main:6632092019520",
+    messageId: "legacy-clawchat-direct-user-1",
+    message: {
+      role: "user",
+      content: "legacy direct key should still sync",
+      provenance: {
+        sourceChannel: "webchat",
+      },
+    },
+  });
+  harness.emit({
+    sessionFile: "agent:main:6632092019520",
+    messageId: "legacy-clawchat-direct-assistant-1",
+    message: {
+      role: "assistant",
+      content: "legacy direct assistant reply should still sync",
+    },
+  });
+  harness.emit({
+    sessionFile: "agent:main:6597711675232",
+    messageId: "legacy-agent-main-direct-user-1",
+    message: {
+      role: "user",
+      content: "legacy agent main direct key should still sync",
+      provenance: {
+        sourceChannel: "webchat",
+      },
+    },
+  });
+  harness.emit({
+    sessionFile: "legacy-user",
+    messageId: "legacy-nondigit-user-1",
+    message: {
+      role: "user",
+      content: "non-digit legacy key should stay untouched",
+      provenance: {
+        sourceChannel: "webchat",
+      },
+    },
+  });
+
+  harness.dispose();
+  assert.deepEqual(
+    harness.forwarded.map((update) => [update.sessionKey, update.source]),
+    [
+      ["agent:main:clawchat:group:6726580510113", "control_ui_user"],
+      ["agent:main:clawchat:direct:6632092019520", "control_ui_user"],
+      ["agent:main:clawchat:direct:6632092019520", "control_ui_reply"],
+      ["agent:main:clawchat:direct:6597711675232", "control_ui_user"],
+      ["legacy-user", "control_ui_user"],
+    ],
+  );
+});
+
 test("normal control UI user and assistant turns both forward to IM", async () => {
   const harness = installForwardCollector();
 
