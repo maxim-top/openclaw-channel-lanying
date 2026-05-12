@@ -27,6 +27,14 @@ export function normalizeSessionSyncText(value: unknown): string {
     .trim();
 }
 
+export function isSilentSessionSyncReply(value: unknown): boolean {
+  const text = extractSessionSyncText(value).trim();
+  if (!text) {
+    return false;
+  }
+  return text.toUpperCase() === "NO_REPLY";
+}
+
 export function sessionSyncTextsLookDuplicated(left: unknown, right: unknown): boolean {
   const a = normalizeSessionSyncText(left);
   const b = normalizeSessionSyncText(right);

@@ -24,6 +24,7 @@ import {
 } from "./channel/router-target.js";
 import {
   extractSessionSyncText,
+  isSilentSessionSyncReply,
 } from "./channel/session-message-sync.js";
 import { createClawchatSessionMessageFlow } from "./channel/session-message-flow.js";
 import {
@@ -1748,6 +1749,12 @@ class ClawchatSession {
         : undefined;
     const normalizedRole = typeof role === "string" ? role.trim().toLowerCase() : "";
     if (normalizedSource === "control_ui_reply" && normalizedRole === "assistant") {
+      if (isSilentSessionSyncReply(content)) {
+        logDebug("skip session_message_sync for silent control_ui_reply", {
+          sessionKey: payloadSessionKey,
+        });
+        return;
+      }
       const parentSuppression = this.shouldSuppressParentAssistantReplyAfterSubagent({
         sessionKey: payloadSessionKey,
       });

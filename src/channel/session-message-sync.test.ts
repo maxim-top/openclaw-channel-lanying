@@ -13,6 +13,7 @@ import {
 } from "./message.js";
 import {
   extractSessionSyncText,
+  isSilentSessionSyncReply,
   sessionSyncTextsLookDuplicated,
 } from "./session-message-sync.js";
 
@@ -262,6 +263,21 @@ test("session sync text helpers flatten structured content and match parent foll
   );
   assert.equal(sessionSyncTextsLookDuplicated(childResult, parentFollowup), true);
   assert.equal(sessionSyncTextsLookDuplicated(childResult, "这是完全不同的回复"), false);
+});
+
+test("silent session sync reply detects NO_REPLY across spacing and structured content", () => {
+  assert.equal(isSilentSessionSyncReply(" NO_REPLY "), true);
+  assert.equal(
+    isSilentSessionSyncReply([
+      {
+        type: "text",
+        text: "no_reply",
+      },
+    ]),
+    true,
+  );
+  assert.equal(isSilentSessionSyncReply("NO_REPLY please"), false);
+  assert.equal(isSilentSessionSyncReply(""), false);
 });
 
 test("removeOpenclawEdgeMention strips mention with unicode whitespace", () => {
