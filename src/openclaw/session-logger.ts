@@ -1,4 +1,4 @@
-import { logDebug } from "../shared/logging.js";
+import { logDebug, redactForLog } from "../shared/logging.js";
 import { asPlainObject, pickId } from "../shared/utils.js";
 import { normalizeClawchatSessionKey } from "../channel/message.js";
 
@@ -6,6 +6,7 @@ const GLOBAL_SESSION_LOGGER_INSTALLED = "__clawchatSessionLoggerInstalled";
 const SESSION_SYNC_DEDUPE_TTL_MS = 30_000;
 const SESSION_SOURCE_TTL_MS = 30 * 60_000;
 const FORWARDED_USER_TURN_TTL_MS = 60_000;
+const RECENT_MESSAGE_ID_TTL_MS = 5 * 60_000;
 const RECENT_UPDATES_LIMIT = 20;
 const BODY_PREVIEW_MAX = 200;
 const CLAWCHAT_CHANNEL_IDS = new Set(["clawchat", "clawchat-router", "lanying"]);
@@ -62,6 +63,7 @@ type SessionLoggerInstallOptions = {
 };
 
 const recentUpdateKeys = new Map<string, number>();
+const recentObservedMessageIds = new Map<string, { seenAt: number; count: number }>();
 const recentSessionSources = new Map<string, { source: RememberedSessionSource; seenAt: number }>();
 const recentSessionSyncVariants = new Map<string, { variant: SessionSyncVariant; seenAt: number }>();
 const recentForwardedControlUiUsers = new Map<
@@ -74,6 +76,11 @@ function cleanupRecentState(now = Date.now()): void {
   for (const [key, seenAt] of recentUpdateKeys.entries()) {
     if (now - seenAt > SESSION_SYNC_DEDUPE_TTL_MS) {
       recentUpdateKeys.delete(key);
+    }
+  }
+  for (const [key, entry] of recentObservedMessageIds.entries()) {
+    if (now - entry.seenAt > RECENT_MESSAGE_ID_TTL_MS) {
+      recentObservedMessageIds.delete(key);
     }
   }
   for (const [key, entry] of recentSessionSources.entries()) {
@@ -714,6 +721,33 @@ function extractBodyPreview(value: unknown): string {
   return "";
 }
 
+function rememberObservedMessageId(params: {
+  sessionKey: string;
+  messageId?: string;
+  role?: string;
+  bodyPreview?: string;
+}): void {
+  const messageId = typeof params.messageId === "string" ? params.messageId.trim() : "";
+  if (!messageId) {
+    return;
+  }
+  const now = Date.now();
+  cleanupRecentState(now);
+  const key = `${params.sessionKey}|${messageId}`;
+  const current = recentObservedMessageIds.get(key);
+  const nextCount = (current?.count ?? 0) + 1;
+  recentObservedMessageIds.set(key, { seenAt: now, count: nextCount });
+  if (nextCount > 1) {
+    logDebug("duplicate onSessionTranscriptUpdate observed for same session/messageId", {
+      session: params.sessionKey,
+      messageId,
+      count: nextCount,
+      role: params.role || undefined,
+      bodyPreview: params.bodyPreview || undefined,
+    });
+  }
+}
+
 function rememberSnapshot(update: SessionTranscriptUpdate): void {
   const message = asPlainObject(update.message);
   recentSnapshots.push({
@@ -790,16 +824,46 @@ export function installGlobalOpenClawSessionLogger(
   )((update) => {
     const message = asPlainObject(update.message);
     const sessionIdentity = resolveSessionIdentity(update);
+    const role = normalizeHint(message?.role ?? message?.authorRole);
+    const bodyPreview = extractBodyPreview(update.message);
+    rememberObservedMessageId({
+      sessionKey: sessionIdentity,
+      messageId: update.messageId,
+      role,
+      bodyPreview,
+    });
+    try {
+      logDebug(
+        `onSessionTranscriptUpdate observed\n${JSON.stringify(
+          redactForLog({
+            session: sessionIdentity,
+            messageId: update.messageId,
+            source: update.source ?? null,
+            syncVariant: update.syncVariant ?? null,
+            observedMessageType: update.observedMessageType ?? null,
+            observedMessageTypeSource: update.observedMessageTypeSource ?? null,
+            rawUpdate: update,
+          }),
+          null,
+          2,
+        )}`,
+      );
+    } catch (err) {
+      logDebug("onSessionTranscriptUpdate observed stringify_failed", {
+        session: sessionIdentity,
+        messageId: update.messageId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     if (shouldLogSubagentBootstrapTranscriptUpdate(update)) {
       logDebug("subagent bootstrap transcript update observed", {
         session: sessionIdentity,
         messageId: update.messageId,
-        role: normalizeHint(message?.role ?? message?.authorRole) || undefined,
-        bodyPreview: extractBodyPreview(update.message) || undefined,
+        role: role || undefined,
+        bodyPreview: bodyPreview || undefined,
       });
     }
     const source = resolveUpdateSyncSource(update);
-    const role = normalizeHint(message?.role ?? message?.authorRole);
     const currentMessageSyncVariant = resolveCurrentMessageSyncVariant(sessionIdentity, message);
     const syncVariant =
       extractSyncVariant(update.syncVariant) ||
