@@ -103,6 +103,31 @@ test("normal control UI user turns without provenance do not get fallback basis"
   assert.equal(harness.forwarded[0]?.observedMessageTypeSource, undefined);
 });
 
+test("OpenClaw prompt context envelope for an IM-origin current message is not forwarded", async () => {
+  const harness = installForwardCollector();
+
+  harness.emit({
+    sessionFile: "agent:main:subagent:child-with-knowledge-context",
+    messageId: "knowledge-context-user-1",
+    message: {
+      role: "user",
+      content: [
+        "[Retrieved knowledge context]",
+        "internal knowledge should not be visible",
+        "[End knowledge context]",
+        "[Group context messages since last trigger]",
+        "[AI] prior result",
+        "",
+        "[Current message]",
+        "@chatbot_qkyimzwkzd git clone git@github.com:maxim-top/openclaw-channel-clawchat.git 到/tmp/目录",
+      ].join("\n"),
+    },
+  });
+
+  harness.dispose();
+  assert.equal(harness.forwarded.length, 0);
+});
+
 test("subagent bootstrap without provenance is marked as fallback control_ui_user", async () => {
   const harness = installForwardCollector();
 

@@ -18,6 +18,13 @@ const OPENCLAW_NEXT_TURN_RUNTIME_CONTEXT_HEADER =
   "OpenClaw runtime context for the immediately preceding user message.";
 const OPENCLAW_RUNTIME_EVENT_HEADER = "OpenClaw runtime event.";
 const OPENCLAW_RUNTIME_CONTEXT_CUSTOM_TYPE = "openclaw.runtime-context";
+const OPENCLAW_CURRENT_MESSAGE_MARKER = "[Current message]";
+const OPENCLAW_PROMPT_CONTEXT_SENTINELS = [
+  "[Retrieved knowledge context]",
+  "[End knowledge context]",
+  "[Group context messages since last trigger]",
+  OPENCLAW_CURRENT_MESSAGE_MARKER,
+] as const;
 const LEADING_TIMESTAMP_PREFIX_RE = /^\[[A-Za-z]{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}[^\]]*\] */;
 const INBOUND_META_SENTINELS = [
   "Conversation info (untrusted metadata):",
@@ -538,7 +545,12 @@ function stripInboundMetadata(text: string): string {
 }
 
 function normalizeVisibleUserText(text: string): string {
-  return stripInboundMetadata(text).replace(/\s+/g, " ").trim();
+  const currentMessageIndex = text.lastIndexOf(OPENCLAW_CURRENT_MESSAGE_MARKER);
+  const visibleText =
+    currentMessageIndex >= 0
+      ? text.slice(currentMessageIndex + OPENCLAW_CURRENT_MESSAGE_MARKER.length)
+      : text;
+  return stripInboundMetadata(visibleText).replace(/\s+/g, " ").trim();
 }
 
 function hasInjectedMetadataEnvelope(text: string): boolean {
@@ -549,7 +561,10 @@ function hasInjectedMetadataEnvelope(text: string): boolean {
     return true;
   }
   const normalized = text.trim();
-  return INBOUND_META_SENTINELS.some((sentinel) => normalized.includes(sentinel));
+  return (
+    INBOUND_META_SENTINELS.some((sentinel) => normalized.includes(sentinel)) ||
+    OPENCLAW_PROMPT_CONTEXT_SENTINELS.some((sentinel) => normalized.includes(sentinel))
+  );
 }
 
 function extractMessageVisibleText(value: unknown): string {

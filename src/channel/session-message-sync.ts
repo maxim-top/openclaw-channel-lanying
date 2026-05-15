@@ -20,9 +20,18 @@ function extractYieldResultMessage(value: unknown): string {
   return typeof argumentsObj.message === "string" ? argumentsObj.message : "";
 }
 
+function stripOpenClawRuntimeContextFromVisibleText(text: string): string {
+  const marker = "[Current message]";
+  const index = text.lastIndexOf(marker);
+  if (index < 0) {
+    return text;
+  }
+  return text.slice(index + marker.length).trim();
+}
+
 export function extractSessionSyncText(value: unknown): string {
   if (typeof value === "string") {
-    return value;
+    return stripOpenClawRuntimeContextFromVisibleText(value);
   }
   if (Array.isArray(value)) {
     return value.map((item) => extractSessionSyncText(item)).filter(Boolean).join("\n\n");

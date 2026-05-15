@@ -290,6 +290,24 @@ test("session sync text helpers flatten structured content and match parent foll
   assert.equal(sessionSyncTextsLookDuplicated(childResult, "这是完全不同的回复"), false);
 });
 
+test("session sync text helpers keep only current message from injected runtime context", () => {
+  const injected = [
+    "[Retrieved knowledge context]",
+    "internal knowledge should not be visible",
+    "[End knowledge context]",
+    "[Group context messages since last trigger]",
+    "[AI] previous internal context",
+    "",
+    "[Current message]",
+    "@chatbot_qkyimzwkzd git clone git@github.com:maxim-top/openclaw-channel-clawchat.git 到/tmp/目录",
+  ].join("\n");
+
+  assert.equal(
+    extractSessionSyncText(injected),
+    "@chatbot_qkyimzwkzd git clone git@github.com:maxim-top/openclaw-channel-clawchat.git 到/tmp/目录",
+  );
+});
+
 test("session sync text helpers extract sessions_yield result message", () => {
   const childYieldResult = [
     {
