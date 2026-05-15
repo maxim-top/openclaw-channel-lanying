@@ -25,6 +25,7 @@ import {
 import {
   extractSessionSyncText,
   isSilentSessionSyncReply,
+  sessionSyncTextsLookDuplicated,
 } from "./channel/session-message-sync.js";
 import { createClawchatSessionMessageFlow } from "./channel/session-message-flow.js";
 import {
@@ -447,7 +448,7 @@ class ClawchatSession {
     {
       childSessionKey: string;
       updatedAt: number;
-      pendingParentSuppression: boolean;
+      text: string;
     }
   >();
   private missingSessionMappingSeedPromise: Promise<void> | null = null;
@@ -516,9 +517,14 @@ class ClawchatSession {
   private rememberSubagentAssistantReplyForParentSuppression(params: {
     childSessionKey: string;
     lineage: { parentSessionKey?: string; rootSessionKey?: string };
+    text: string;
   }): void {
     const childSessionKey = this.normalizeOptionalSessionKey(params.childSessionKey);
     if (!childSessionKey || !childSessionKey.includes(":subagent:")) {
+      return;
+    }
+    const normalizedText = params.text.trim();
+    if (!normalizedText) {
       return;
     }
     const now = Date.now();
@@ -534,29 +540,43 @@ class ClawchatSession {
       this.recentSubagentAssistantReplyByParentSessionKey.set(parentSessionKey, {
         childSessionKey,
         updatedAt: now,
-        pendingParentSuppression: true,
+        text: normalizedText,
       });
     }
   }
 
   private shouldSuppressParentAssistantReplyAfterSubagent(params: {
     sessionKey: string;
+    text: string;
   }): { childSessionKey: string } | null {
     const sessionKey = this.normalizeOptionalSessionKey(params.sessionKey);
     if (!sessionKey || sessionKey.includes(":subagent:")) {
       return null;
     }
-    this.cleanupRecentSubagentAssistantReplies();
-    const previous = this.recentSubagentAssistantReplyByParentSessionKey.get(sessionKey);
-    if (!previous?.pendingParentSuppression) {
+    const normalizedText = params.text.trim();
+    if (!normalizedText) {
       return null;
     }
-    this.recentSubagentAssistantReplyByParentSessionKey.set(sessionKey, {
-      ...previous,
-      pendingParentSuppression: false,
-      updatedAt: Date.now(),
-    });
+    this.cleanupRecentSubagentAssistantReplies();
+    const previous = this.recentSubagentAssistantReplyByParentSessionKey.get(sessionKey);
+    if (!previous) {
+      return null;
+    }
+    if (!sessionSyncTextsLookDuplicated(previous.text, normalizedText)) {
+      return null;
+    }
     return { childSessionKey: previous.childSessionKey };
+  }
+
+  private deriveRouterTargetSessionKey(rawTarget: string): string | undefined {
+    const target = parseRouterDeliveryTarget(rawTarget);
+    if (!target) {
+      return undefined;
+    }
+    if (target.kind === "group") {
+      return this.normalizeOptionalSessionKey(`agent:main:clawchat-router:group:${target.id}`);
+    }
+    return this.normalizeOptionalSessionKey(`agent:main:clawchat-router:direct:${target.id}`);
   }
 
   private rememberSessionSyncVariant(sessionKey: string, syncVariant?: string): void {
@@ -1622,11 +1642,21 @@ class ClawchatSession {
     return `router_reply_${Date.now()}_${this.routerReplySeq}`;
   }
 
+  private buildSuppressedRouterTargetResult(): {
+    messageId: string;
+    suppressed: boolean;
+  } {
+    return {
+      messageId: "",
+      suppressed: true,
+    };
+  }
+
   async sendRouterTargetText(
     rawTarget: string,
     text: string,
     account?: ResolvedClawchatAccount,
-  ): Promise<string> {
+  ): Promise<{ messageId: string; suppressed: boolean }> {
     const target = parseRouterDeliveryTarget(rawTarget);
     if (!target) {
       throw new Error(`Invalid ClawChat router target: ${rawTarget}`);
@@ -1638,6 +1668,18 @@ class ClawchatSession {
     await this.ensureReady(cfgToUse);
     if (!this.client || !this.selfId) {
       throw new Error("ClawChat client is not ready for router delivery");
+    }
+    const parentSuppression = this.shouldSuppressParentAssistantReplyAfterSubagent({
+      sessionKey: this.deriveRouterTargetSessionKey(rawTarget) ?? "",
+      text,
+    });
+    if (parentSuppression) {
+      logDebug("suppress parent router_reply after subagent assistant result", {
+        rawTarget,
+        childSessionKey: parentSuppression.childSessionKey,
+        textPreview: text.slice(0, 80),
+      });
+      return this.buildSuppressedRouterTargetResult();
     }
 
     const messageId = this.nextRouterReplyMessageId();
@@ -1654,7 +1696,10 @@ class ClawchatSession {
         text,
       }),
     );
-    return messageId;
+    return {
+      messageId,
+      suppressed: false,
+    };
   }
 
   async sendSessionMessageSyncToSelf(update: {
@@ -1749,6 +1794,7 @@ class ClawchatSession {
         : undefined;
     const normalizedRole = typeof role === "string" ? role.trim().toLowerCase() : "";
     if (normalizedSource === "control_ui_reply" && normalizedRole === "assistant") {
+      const extractedText = extractSessionSyncText(content).trim();
       if (isSilentSessionSyncReply(content)) {
         logDebug("skip session_message_sync for silent control_ui_reply", {
           sessionKey: payloadSessionKey,
@@ -1757,18 +1803,20 @@ class ClawchatSession {
       }
       const parentSuppression = this.shouldSuppressParentAssistantReplyAfterSubagent({
         sessionKey: payloadSessionKey,
+        text: extractedText,
       });
       if (parentSuppression) {
         logDebug("suppress parent session_message_sync after subagent assistant result", {
           sessionKey: payloadSessionKey,
           childSessionKey: parentSuppression.childSessionKey,
-          textPreview: extractSessionSyncText(content).slice(0, 80),
+          textPreview: extractedText.slice(0, 80),
         });
         return;
       }
       this.rememberSubagentAssistantReplyForParentSuppression({
         childSessionKey: payloadSessionKey,
         lineage: payloadLineage,
+        text: extractedText,
       });
     }
     const inheritedObservedOriginFacts =
@@ -2606,11 +2654,12 @@ export const clawchatPlugin: any = {
       }
       const rawTarget = typeof to === "string" ? to.trim() : "";
       if (parseRouterDeliveryTarget(rawTarget)) {
-        const messageId = await session.sendRouterTargetText(rawTarget, text, account);
+        const routerResult = await session.sendRouterTargetText(rawTarget, text, account);
         return {
           channel: CLAWCHAT_CHANNEL_ID,
-          messageId: String(messageId ?? ""),
+          messageId: String(routerResult.messageId ?? ""),
           chatId: rawTarget,
+          ...(routerResult.suppressed ? { suppressed: true } : {}),
         };
       }
       const mappedGroupTarget =

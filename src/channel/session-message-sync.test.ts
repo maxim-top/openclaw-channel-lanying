@@ -265,6 +265,66 @@ test("session sync text helpers flatten structured content and match parent foll
   assert.equal(sessionSyncTextsLookDuplicated(childResult, "这是完全不同的回复"), false);
 });
 
+test("session sync text helpers extract sessions_yield result message", () => {
+  const childYieldResult = [
+    {
+      type: "toolCall",
+      id: "call-1",
+      name: "sessions_yield",
+      arguments: {
+        message: "我完成了：讲了一个关于数字3的笑话。",
+      },
+    },
+  ];
+
+  assert.equal(extractSessionSyncText(childYieldResult), "我完成了：讲了一个关于数字3的笑话。");
+});
+
+test("session sync text helpers extract sessions_yield result message from json arguments", () => {
+  const childYieldResult = [
+    {
+      type: "toolCall",
+      id: "call-1b",
+      name: "sessions_yield",
+      arguments: JSON.stringify({
+        message: "我完成了：讲了另一个关于数字3的笑话。",
+      }),
+    },
+  ];
+
+  assert.equal(
+    extractSessionSyncText(childYieldResult),
+    "我完成了：讲了另一个关于数字3的笑话。",
+  );
+});
+
+test("session sync text helpers ignore sessions_yield without usable message", () => {
+  assert.equal(
+    extractSessionSyncText([
+      {
+        type: "toolCall",
+        id: "call-2",
+        name: "sessions_yield",
+        arguments: {},
+      },
+    ]),
+    "",
+  );
+  assert.equal(
+    extractSessionSyncText([
+      {
+        type: "toolCall",
+        id: "call-3",
+        name: "sessions_yield",
+        arguments: {
+          message: 123,
+        },
+      },
+    ]),
+    "",
+  );
+});
+
 test("silent session sync reply detects NO_REPLY across spacing and structured content", () => {
   assert.equal(isSilentSessionSyncReply(" NO_REPLY "), true);
   assert.equal(

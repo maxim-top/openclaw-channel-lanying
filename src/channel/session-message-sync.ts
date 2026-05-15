@@ -1,4 +1,24 @@
-import { asPlainObject } from "../shared/utils.js";
+import { asPlainObject, maybeParseJson } from "../shared/utils.js";
+
+function extractYieldResultMessage(value: unknown): string {
+  const obj = asPlainObject(value);
+  if (!obj) {
+    return "";
+  }
+  if (obj.type !== "toolCall") {
+    return "";
+  }
+  if (typeof obj.name !== "string" || obj.name.trim() !== "sessions_yield") {
+    return "";
+  }
+  const rawArguments =
+    typeof obj.arguments === "string" ? maybeParseJson(obj.arguments) : obj.arguments;
+  const argumentsObj = asPlainObject(rawArguments);
+  if (!argumentsObj) {
+    return "";
+  }
+  return typeof argumentsObj.message === "string" ? argumentsObj.message : "";
+}
 
 export function extractSessionSyncText(value: unknown): string {
   if (typeof value === "string") {
@@ -17,7 +37,7 @@ export function extractSessionSyncText(value: unknown): string {
   if (Object.prototype.hasOwnProperty.call(obj, "content")) {
     return extractSessionSyncText(obj.content);
   }
-  return "";
+  return extractYieldResultMessage(obj);
 }
 
 export function normalizeSessionSyncText(value: unknown): string {
