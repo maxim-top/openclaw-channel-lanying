@@ -1,4 +1,4 @@
-import { clawchatPlugin, emitSessionMessageSyncToSelf } from "./src/channel.js";
+import { clawchatPlugin, emitSessionTranscriptObservedToSelf } from "./src/channel.js";
 import {
   formatGlobalOpenClawSessionLoggerStatus,
   installGlobalOpenClawSessionLogger,
@@ -32,10 +32,10 @@ const plugin = {
     const disposeSessionLogger = installGlobalOpenClawSessionLogger(api.runtime, {
       onSessionTranscriptUpdate: async (update) => {
         try {
-          await emitSessionMessageSyncToSelf(update);
+          await emitSessionTranscriptObservedToSelf(update);
         } catch {
-          // sendSessionMessageSyncToSelf already logs failures; never surface
-          // transcript sync forwarding as an unhandled plugin rejection.
+          // sendSessionTranscriptObservedToSelf already logs failures; never surface
+          // transcript forwarding as an unhandled plugin rejection.
         }
       },
     });

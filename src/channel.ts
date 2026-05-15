@@ -24,7 +24,6 @@ import {
 } from "./channel/router-target.js";
 import {
   extractSessionSyncText,
-  isSilentSessionSyncReply,
   sessionSyncTextsLookDuplicated,
 } from "./channel/session-message-sync.js";
 import { createClawchatSessionMessageFlow } from "./channel/session-message-flow.js";
@@ -133,7 +132,7 @@ export function resolveClawchatPluginVersion(moduleUrl = import.meta.url): strin
   return "";
 }
 const CLAWCHAT_PLUGIN_VERSION = resolveClawchatPluginVersion();
-const CLAWCHAT_API_VERSION = 2;
+const CLAWCHAT_API_VERSION = 3;
 export function resolveClawchatSdkModulePath(moduleUrl = import.meta.url): string {
   const moduleDir = path.dirname(fileURLToPath(moduleUrl));
   const candidatePaths = [
@@ -426,8 +425,16 @@ class ClawchatSession {
   >();
   private routerGroupQueueByGroupId = new Map<string, { tail: Promise<void>; pending: number }>();
   private routerReplySeq = 0;
+  private transcriptObservedSeq = 0;
   private sessionMappingByGroupKey = new Map<string, { sessionKey: string; updatedAt: number }>();
   private recentSessionSyncVariantBySessionKey = new Map<string, string>();
+  private recentTriggerMsgIdBySessionKey = new Map<
+    string,
+    {
+      msgId: string;
+      updatedAt: number;
+    }
+  >();
   private sessionMappingBySessionKey = new Map<
     string,
     {
@@ -460,7 +467,13 @@ class ClawchatSession {
     resolveAgentRoute: (params) => getClawchatRuntime().channel.routing.resolveAgentRoute(params),
     resolveStorePath: (store, opts) => getClawchatRuntime().channel.session.resolveStorePath(store, opts),
     readSessionUpdatedAt: (params) => getClawchatRuntime().channel.session.readSessionUpdatedAt(params),
-    recordInboundSession: (params) => getClawchatRuntime().channel.session.recordInboundSession(params),
+    recordInboundSession: async (params) => {
+      await getClawchatRuntime().channel.session.recordInboundSession(params);
+      this.rememberRecentTriggerMsgId(
+        params.sessionKey,
+        this.extractLocalTriggerMsgId(asPlainObject(params.ctx)),
+      );
+    },
     resolveEnvelopeFormatOptions: (cfg) => getClawchatRuntime().channel.reply.resolveEnvelopeFormatOptions(cfg),
     formatAgentEnvelope: (params) => getClawchatRuntime().channel.reply.formatAgentEnvelope(params),
     finalizeInboundContext: (ctx) => getClawchatRuntime().channel.reply.finalizeInboundContext(ctx),
@@ -475,7 +488,7 @@ class ClawchatSession {
     handleSessionMapSettingsSync: (params) => this.handleSessionMapSettingsSync(params),
     isSessionMapSyncEnabled: (cfg) => this.isSessionMapSyncEffectivelyEnabled(cfg),
     sendText: (target, text, account, ext) => this.sendText(target, text, account, ext),
-    sendSessionMessageSyncToSelf: (update) => this.sendSessionMessageSyncToSelf(update),
+    sendSessionTranscriptObservedToSelf: (update) => this.sendSessionTranscriptObservedToSelf(update),
     resolveSessionMapping: (params) => this.resolveSessionMapping(params),
     applySessionMappingSignal: (signal) => this.applySessionMappingSignal(signal),
     pendingGroupContext: this.pendingGroupContext,
@@ -670,6 +683,122 @@ class ClawchatSession {
       current = parent;
     }
     return normalizedSessionKey;
+  }
+
+  private extractLocalTriggerMsgId(entry: Record<string, unknown> | null): string | undefined {
+    if (!entry) {
+      return undefined;
+    }
+    const candidateKeys = [
+      "MessageSidFull",
+      "MessageSid",
+      "messageSidFull",
+      "messageSid",
+      "msgId",
+      "msg_id",
+    ] as const;
+    for (const key of candidateKeys) {
+      const value = entry[key];
+      if (typeof value === "string" && value.trim()) {
+        return value.trim();
+      }
+    }
+    return undefined;
+  }
+
+  private rememberRecentTriggerMsgId(sessionKey: string, msgId?: string): void {
+    const normalizedSessionKey = this.normalizeSessionMappingSessionKey(sessionKey);
+    const normalizedMsgId = typeof msgId === "string" ? msgId.trim() : "";
+    if (!normalizedSessionKey || !normalizedMsgId) {
+      return;
+    }
+    this.recentTriggerMsgIdBySessionKey.set(normalizedSessionKey, {
+      msgId: normalizedMsgId,
+      updatedAt: Date.now(),
+    });
+    this.pruneRecentTriggerMsgIds();
+  }
+
+  private pruneRecentTriggerMsgIds(now = Date.now()): void {
+    const ttlMs = 24 * 60 * 60 * 1000;
+    for (const [sessionKey, entry] of this.recentTriggerMsgIdBySessionKey.entries()) {
+      if (now - entry.updatedAt > ttlMs) {
+        this.recentTriggerMsgIdBySessionKey.delete(sessionKey);
+      }
+    }
+  }
+
+  private getRecentTriggerMsgId(sessionKey?: string): string | undefined {
+    if (!sessionKey) {
+      return undefined;
+    }
+    const normalizedSessionKey = this.normalizeSessionMappingSessionKey(sessionKey);
+    if (!normalizedSessionKey) {
+      return undefined;
+    }
+    this.pruneRecentTriggerMsgIds();
+    return this.recentTriggerMsgIdBySessionKey.get(normalizedSessionKey)?.msgId;
+  }
+
+  private resolveLocalTriggerMsgIdFromSessions(
+    sessions: Record<string, unknown>,
+    sessionKey: string,
+    lineage?: { parentSessionKey?: string; rootSessionKey?: string },
+  ): string | undefined {
+    const normalizedSessionKey = this.normalizeSessionMappingSessionKey(sessionKey);
+    if (!normalizedSessionKey) {
+      return undefined;
+    }
+    const candidates: string[] = [normalizedSessionKey];
+    const seen = new Set<string>();
+    let current = normalizedSessionKey;
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      const entry = this.findLocalSessionEntry(sessions, current);
+      const parent = this.resolveLocalParentSessionKey(entry);
+      if (!parent) {
+        break;
+      }
+      candidates.push(parent);
+      current = parent;
+    }
+    const explicitParent = this.normalizeOptionalSessionKey(lineage?.parentSessionKey);
+    if (explicitParent && !seen.has(explicitParent)) {
+      candidates.push(explicitParent);
+      seen.add(explicitParent);
+    }
+    const explicitRoot = this.normalizeOptionalSessionKey(lineage?.rootSessionKey);
+    if (explicitRoot && !seen.has(explicitRoot)) {
+      candidates.push(explicitRoot);
+      seen.add(explicitRoot);
+    }
+    for (const candidate of candidates) {
+      const triggerMsgId = this.getRecentTriggerMsgId(candidate);
+      if (triggerMsgId) {
+        return triggerMsgId;
+      }
+    }
+    for (const candidate of candidates) {
+      const triggerMsgId = this.extractLocalTriggerMsgId(
+        this.findLocalSessionEntry(sessions, candidate),
+      );
+      if (triggerMsgId) {
+        return triggerMsgId;
+      }
+    }
+    return undefined;
+  }
+
+  private async resolveLocalTriggerMsgId(
+    sessionKey: string,
+    lineage?: { parentSessionKey?: string; rootSessionKey?: string },
+  ): Promise<string | undefined> {
+    const normalizedSessionKey = this.normalizeSessionMappingSessionKey(sessionKey);
+    if (!normalizedSessionKey) {
+      return undefined;
+    }
+    const sessions = await this.loadLocalSessionStore();
+    return this.resolveLocalTriggerMsgIdFromSessions(sessions, normalizedSessionKey, lineage);
   }
 
   private async resolveLocalSessionLineage(sessionKey: string): Promise<{
@@ -975,7 +1104,7 @@ class ClawchatSession {
         sessionKeys: sessionsToSync.map((session) => session.sessionKey),
       });
       for (const session of sessionsToSync) {
-        await this.sendSessionMessageSyncToSelf({
+        await this.sendSessionTranscriptObservedToSelf({
           sessionFile: session.sessionKey,
           sessionKey: session.sessionKey,
           parentSessionKey: session.parentSessionKey,
@@ -1613,7 +1742,10 @@ class ClawchatSession {
     }, delay);
   }
 
-  private async sendRouterReplyToSelf(message: Record<string, unknown>): Promise<void> {
+  private async sendRouterReplyToSelf(
+    message: Record<string, unknown>,
+    options?: { suppressionReason?: string },
+  ): Promise<void> {
     if (!this.client || !this.selfId) {
       logWarn("skip router_reply: client or selfId unavailable", {
         hasClient: Boolean(this.client),
@@ -1628,6 +1760,9 @@ class ClawchatSession {
       ext: JSON.stringify({
         openclaw: {
           type: "router_reply",
+          ...(options?.suppressionReason
+            ? { suppression_reason: options.suppressionReason }
+            : {}),
           message,
         },
         ai: {
@@ -1640,16 +1775,6 @@ class ClawchatSession {
   private nextRouterReplyMessageId(): string {
     this.routerReplySeq = (this.routerReplySeq + 1) % 1_000_000;
     return `router_reply_${Date.now()}_${this.routerReplySeq}`;
-  }
-
-  private buildSuppressedRouterTargetResult(): {
-    messageId: string;
-    suppressed: boolean;
-  } {
-    return {
-      messageId: "",
-      suppressed: true,
-    };
   }
 
   async sendRouterTargetText(
@@ -1673,16 +1798,21 @@ class ClawchatSession {
       sessionKey: this.deriveRouterTargetSessionKey(rawTarget) ?? "",
       text,
     });
+    let suppressionReason: string | undefined;
     if (parentSuppression) {
       logDebug("suppress parent router_reply after subagent assistant result", {
         rawTarget,
         childSessionKey: parentSuppression.childSessionKey,
         textPreview: text.slice(0, 80),
       });
-      return this.buildSuppressedRouterTargetResult();
+      suppressionReason = "duplicate_parent_after_subagent";
     }
 
     const messageId = this.nextRouterReplyMessageId();
+    const routeSessionKey = this.deriveRouterTargetSessionKey(rawTarget) ?? "";
+    const requestMsgId = routeSessionKey
+      ? await this.resolveLocalTriggerMsgId(routeSessionKey)
+      : undefined;
     logDebug("sending router target via self-loop", {
       kind: target.kind,
       id: target.id,
@@ -1694,19 +1824,66 @@ class ClawchatSession {
         from: this.selfId,
         target,
         text,
+        ext: {
+          openclaw: {
+            type: "session_sync_delivery",
+            session: routeSessionKey,
+            source: "control_ui_reply",
+            role: "assistant",
+            message_id: messageId,
+            ...(requestMsgId ? { trigger_msg_id: requestMsgId, request_msg_id: requestMsgId } : {}),
+          },
+          ai: {
+            role: "ai",
+            ai_generate: false,
+          },
+        },
       }),
+      { suppressionReason },
     );
     return {
       messageId,
-      suppressed: false,
+      suppressed: Boolean(suppressionReason),
     };
   }
 
-  async sendSessionMessageSyncToSelf(update: {
+  private nextTranscriptObservedSeq(): number {
+    this.transcriptObservedSeq = (this.transcriptObservedSeq + 1) % Number.MAX_SAFE_INTEGER;
+    if (this.transcriptObservedSeq <= 0) {
+      this.transcriptObservedSeq = 1;
+    }
+    return this.transcriptObservedSeq;
+  }
+
+  private resolveTranscriptVisibleDeliveryOwnership(params: {
+    sessionKey: string;
+    source?: string;
+    role: string;
+    parentSessionKey?: string;
+    rootSessionKey?: string;
+  }): { owner: "plugin" | "connector"; reason: string } {
+    const sessionFacts = resolveClawchatSessionKeyFacts(params.sessionKey);
+    const isRootSession =
+      (!params.parentSessionKey || params.parentSessionKey === sessionFacts.canonicalSessionKey) &&
+      (!params.rootSessionKey || params.rootSessionKey === sessionFacts.canonicalSessionKey);
+    if (
+      params.source === "control_ui_reply" &&
+      params.role === "assistant" &&
+      sessionFacts.isClawchatSession &&
+      !sessionFacts.isSubagent &&
+      isRootSession
+    ) {
+      return { owner: "plugin", reason: "normal_channel_reply" };
+    }
+    return { owner: "connector", reason: "transcript_sync" };
+  }
+
+  async sendSessionTranscriptObservedToSelf(update: {
     sessionFile: string;
     sessionKey?: string;
     message?: unknown;
     messageId?: string;
+    messageTimestamp?: number;
     source?: string;
     syncVariant?: string;
     parentSessionKey?: string;
@@ -1750,141 +1927,90 @@ class ClawchatSession {
       message && Object.prototype.hasOwnProperty.call(message, "content")
         ? message.content
         : update.message;
-    const sessionSyncOverride = normalizedSessionKey
-      ? this.resolvePreferredReplySessionSyncTarget({
-          sessionKey: normalizedSessionKey,
-          source: typeof update.source === "string" ? update.source.trim() : undefined,
-          role,
-        })
-      : null;
-    const payloadSessionKey = sessionSyncOverride?.sessionKey ?? normalizedSessionKey;
-    const mappedPayloadLineage = payloadSessionKey
-      ? this.resolveSessionMappingLineage(payloadSessionKey)
-      : null;
+    const rawMessageTimestamp =
+      typeof update.messageTimestamp === "number" && Number.isFinite(update.messageTimestamp)
+        ? update.messageTimestamp
+        : typeof message?.timestamp === "number" && Number.isFinite(message.timestamp)
+          ? message.timestamp
+          : Number(message?.timestamp ?? message?.createdAt ?? NaN);
+    const effectiveMessageTimestamp =
+      Number.isFinite(rawMessageTimestamp) && rawMessageTimestamp > 0
+        ? Math.trunc(rawMessageTimestamp)
+        : Date.now();
+    const messageSeq = this.nextTranscriptObservedSeq();
     const updateParentSessionKey = this.normalizeOptionalSessionKey(update.parentSessionKey);
     const updateRootSessionKey = this.normalizeOptionalSessionKey(update.rootSessionKey);
     const payloadLineage = {
-      parentSessionKey:
-        sessionSyncOverride?.parentSessionKey ??
-        mappedPayloadLineage?.parentSessionKey ??
-        updateParentSessionKey ??
-        lineage.parentSessionKey,
-      rootSessionKey:
-        sessionSyncOverride?.rootSessionKey ??
-        mappedPayloadLineage?.rootSessionKey ??
-        updateRootSessionKey ??
-        lineage.rootSessionKey,
+      parentSessionKey: updateParentSessionKey ?? lineage.parentSessionKey,
+      rootSessionKey: updateRootSessionKey ?? lineage.rootSessionKey,
       spawnDepth:
         typeof update.spawnDepth === "number" && Number.isFinite(update.spawnDepth)
           ? update.spawnDepth
           : lineage.spawnDepth,
     };
-    if (sessionSyncOverride) {
-      logDebug("override session_message_sync target for control_ui_reply", {
-        originalSessionKey: normalizedSessionKey,
-        overriddenSessionKey: payloadSessionKey,
-        parentSessionKey: payloadLineage.parentSessionKey,
-        rootSessionKey: payloadLineage.rootSessionKey,
-      });
-    }
     const normalizedSource = typeof update.source === "string" ? update.source.trim() : undefined;
     const normalizedSyncVariant =
       typeof update.syncVariant === "string" && update.syncVariant.trim()
         ? update.syncVariant.trim()
         : undefined;
     const normalizedRole = typeof role === "string" ? role.trim().toLowerCase() : "";
+    let suppressionReason: string | undefined;
     if (normalizedSource === "control_ui_reply" && normalizedRole === "assistant") {
       const extractedText = extractSessionSyncText(content).trim();
-      if (isSilentSessionSyncReply(content)) {
-        logDebug("skip session_message_sync for silent control_ui_reply", {
-          sessionKey: payloadSessionKey,
-        });
-        return;
-      }
       const parentSuppression = this.shouldSuppressParentAssistantReplyAfterSubagent({
-        sessionKey: payloadSessionKey,
+        sessionKey: normalizedSessionKey,
         text: extractedText,
       });
       if (parentSuppression) {
-        logDebug("suppress parent session_message_sync after subagent assistant result", {
-          sessionKey: payloadSessionKey,
+        logDebug("suppress parent session_transcript_observed after subagent assistant result", {
+          sessionKey: normalizedSessionKey,
           childSessionKey: parentSuppression.childSessionKey,
           textPreview: extractedText.slice(0, 80),
         });
-        return;
+        suppressionReason = "duplicate_parent_after_subagent";
       }
       this.rememberSubagentAssistantReplyForParentSuppression({
-        childSessionKey: payloadSessionKey,
+        childSessionKey: normalizedSessionKey,
         lineage: payloadLineage,
         text: extractedText,
       });
     }
-    const inheritedObservedOriginFacts =
-      payloadSessionKey.includes(":subagent:") &&
-      normalizedRole === "user" &&
-      !update.senderUserId?.trim() &&
-      !update.observedSenderUserId?.trim() &&
-      normalizedSource === "control_ui_user" &&
-      update.observedMessageType === "control_ui_user" &&
-      update.observedMessageTypeSource === "fallback"
-        ? this.resolveObservedOriginFactsFromSessionMapping(payloadLineage.parentSessionKey) ??
-          this.resolveObservedOriginFactsFromSessionMapping(payloadLineage.rootSessionKey)
-        : null;
     const observedSenderUserId =
       typeof update.observedSenderUserId === "string" && update.observedSenderUserId.trim()
         ? update.observedSenderUserId.trim()
         : typeof update.senderUserId === "string" && update.senderUserId.trim()
           ? update.senderUserId.trim()
-          : inheritedObservedOriginFacts?.senderUserId
-            ? inheritedObservedOriginFacts.senderUserId
           : undefined;
-    const legacySenderUserId =
-      typeof update.senderUserId === "string" && update.senderUserId.trim()
-        ? update.senderUserId.trim()
-        : observedSenderUserId;
     const observedFromUserId =
       typeof update.observedFromUserId === "string" && update.observedFromUserId.trim()
         ? update.observedFromUserId.trim()
-        : inheritedObservedOriginFacts?.fromUserId
-          ? inheritedObservedOriginFacts.fromUserId
         : undefined;
     const observedToId =
       typeof update.observedToId === "string" && update.observedToId.trim()
         ? update.observedToId.trim()
-        : inheritedObservedOriginFacts?.toId
-          ? inheritedObservedOriginFacts.toId
         : undefined;
     const observedChatType =
       typeof update.observedChatType === "string" && update.observedChatType.trim()
         ? update.observedChatType.trim()
-        : inheritedObservedOriginFacts?.chatType
-          ? inheritedObservedOriginFacts.chatType
         : undefined;
     const observedChannel =
       typeof update.observedChannel === "string" && update.observedChannel.trim()
         ? update.observedChannel.trim()
-        : inheritedObservedOriginFacts?.channel
-          ? inheritedObservedOriginFacts.channel
         : undefined;
     const observedMessageType =
-      inheritedObservedOriginFacts?.messageType
-        ? inheritedObservedOriginFacts.messageType
-        : typeof update.observedMessageType === "string" && update.observedMessageType.trim()
+      typeof update.observedMessageType === "string" && update.observedMessageType.trim()
         ? update.observedMessageType.trim()
         : undefined;
     const observedMessageTypeSource =
-      inheritedObservedOriginFacts?.messageType
-        ? "inherited_mapping"
-        : typeof update.observedMessageTypeSource === "string" &&
-            update.observedMessageTypeSource.trim()
-          ? update.observedMessageTypeSource.trim()
-          : undefined;
+      typeof update.observedMessageTypeSource === "string" &&
+      update.observedMessageTypeSource.trim()
+        ? update.observedMessageTypeSource.trim()
+        : undefined;
     const inheritedSyncVariant =
       !normalizedSyncVariant &&
-      payloadSessionKey.includes(":subagent:") &&
+      normalizedSessionKey.includes(":subagent:") &&
       normalizedRole === "user" &&
       normalizedSource === "control_ui_user" &&
-      observedMessageTypeSource === "inherited_mapping" &&
       observedMessageType === "im_inbound_user" &&
       extractSessionSyncText(content).includes("[Subagent Context]")
         ? "im_subagent_bootstrap"
@@ -1894,20 +2020,31 @@ class ClawchatSession {
       !inheritedSyncVariant &&
       normalizedSource === "control_ui_reply" &&
       normalizedRole === "assistant"
-        ? this.consumeRememberedSessionSyncVariant(payloadSessionKey)
+        ? this.consumeRememberedSessionSyncVariant(normalizedSessionKey)
         : undefined;
     const effectiveSyncVariant =
       normalizedSyncVariant ?? inheritedSyncVariant ?? rememberedSyncVariant;
     if (normalizedSource === "control_ui_user" && normalizedRole === "user") {
-      this.rememberSessionSyncVariant(payloadSessionKey, effectiveSyncVariant);
+      this.rememberSessionSyncVariant(normalizedSessionKey, effectiveSyncVariant);
     } else if (normalizedSource === "control_ui_user") {
-      this.rememberSessionSyncVariant(payloadSessionKey, undefined);
+      this.rememberSessionSyncVariant(normalizedSessionKey, undefined);
     }
+    const triggerMsgId = await this.resolveLocalTriggerMsgId(normalizedSessionKey, payloadLineage);
+    const visibleDeliveryOwnership = this.resolveTranscriptVisibleDeliveryOwnership({
+      sessionKey: normalizedSessionKey,
+      source: normalizedSource,
+      role: normalizedRole,
+      parentSessionKey: payloadLineage.parentSessionKey,
+      rootSessionKey: payloadLineage.rootSessionKey,
+    });
     const normalizedPayload = {
-      session: payloadSessionKey,
+      session: normalizedSessionKey,
       ...(typeof update.messageId === "string" && update.messageId.trim()
         ? { message_id: update.messageId.trim() }
         : {}),
+      ...(triggerMsgId ? { trigger_msg_id: triggerMsgId } : {}),
+      message_seq: messageSeq,
+      message_timestamp: effectiveMessageTimestamp,
       ...(payloadLineage.parentSessionKey
         ? { parent_session: payloadLineage.parentSessionKey }
         : {}),
@@ -1920,8 +2057,11 @@ class ClawchatSession {
           : {}),
       ...(normalizedSource ? { source: normalizedSource } : {}),
       ...(effectiveSyncVariant ? { sync_variant: effectiveSyncVariant } : {}),
-      ...(legacySenderUserId
-        ? { sender_user_id: legacySenderUserId }
+      ...(suppressionReason ? { suppression_reason: suppressionReason } : {}),
+      visible_delivery_owner: visibleDeliveryOwnership.owner,
+      visible_delivery_reason: visibleDeliveryOwnership.reason,
+      ...(typeof update.senderUserId === "string" && update.senderUserId.trim()
+        ? { sender_user_id: update.senderUserId.trim() }
         : {}),
       ...(observedSenderUserId ? { observed_sender_user_id: observedSenderUserId } : {}),
       ...(observedFromUserId ? { observed_from_user_id: observedFromUserId } : {}),
@@ -1949,7 +2089,7 @@ class ClawchatSession {
         content: "",
         ext: JSON.stringify({
           openclaw: {
-            type: "session_message_sync",
+            type: "session_transcript_observed",
             ...normalizedPayload,
           },
         }),
@@ -2432,11 +2572,12 @@ class ClawchatSession {
 
 const session = new ClawchatSession();
 
-export async function emitSessionMessageSyncToSelf(update: {
+export async function emitSessionTranscriptObservedToSelf(update: {
   sessionFile: string;
   sessionKey?: string;
   message?: unknown;
   messageId?: string;
+  messageTimestamp?: number;
   source?: string;
   syncVariant?: string;
   senderUserId?: string;
@@ -2448,7 +2589,7 @@ export async function emitSessionMessageSyncToSelf(update: {
   observedMessageType?: string;
   observedMessageTypeSource?: string;
 }): Promise<void> {
-  await session.sendSessionMessageSyncToSelf(update);
+  await session.sendSessionTranscriptObservedToSelf(update);
 }
 
 // OpenClaw channel plugin export.

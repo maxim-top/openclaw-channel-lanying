@@ -6,7 +6,7 @@ import test from "node:test";
 import {
   extractSessionMapSettingsSync,
   extractSessionMappingSignal,
-  extractSessionMessageSyncSignal,
+  extractSessionTranscriptObservedSignal,
   extractSessionSyncDeliverySignal,
   removeOpenclawEdgeMention,
   stripLeadingAtMentions,
@@ -17,42 +17,10 @@ import {
   sessionSyncTextsLookDuplicated,
 } from "./session-message-sync.js";
 
-test("session_message_sync command envelope is parsed as a control signal", () => {
+test("session_transcript_observed signal reads snake_case message_id", () => {
   const ext = {
     openclaw: {
-      type: "session_message_sync",
-      session: "agent:main:clawchat-router:group:group-42",
-      source: "control_ui_reply",
-      messageId: "reply-1",
-      message: {
-        role: "assistant",
-        content: "assistant reply that must not become inbound text",
-      },
-    },
-  };
-
-  assert.deepEqual(
-    extractSessionMessageSyncSignal(
-      {
-        type: "command",
-        ext: JSON.stringify(ext),
-      },
-      {},
-    ),
-    {
-      type: "session_message_sync",
-      session: "agent:main:clawchat-router:group:group-42",
-      source: "control_ui_reply",
-      role: "assistant",
-      messageId: "reply-1",
-    },
-  );
-});
-
-test("session_message_sync signal reads snake_case message_id", () => {
-  const ext = {
-    openclaw: {
-      type: "session_message_sync",
+      type: "session_transcript_observed",
       session: "agent:main:clawchat:group:group-42",
       source: "control_ui_reply",
       message_id: "reply-snake-1",
@@ -64,7 +32,7 @@ test("session_message_sync signal reads snake_case message_id", () => {
   };
 
   assert.deepEqual(
-    extractSessionMessageSyncSignal(
+    extractSessionTranscriptObservedSignal(
       {
         type: "command",
         ext: JSON.stringify(ext),
@@ -72,7 +40,7 @@ test("session_message_sync signal reads snake_case message_id", () => {
       {},
     ),
     {
-      type: "session_message_sync",
+      type: "session_transcript_observed",
       session: "agent:main:clawchat:group:group-42",
       source: "control_ui_reply",
       role: "assistant",
@@ -81,9 +49,66 @@ test("session_message_sync signal reads snake_case message_id", () => {
   );
 });
 
+test("session_transcript_observed command envelope is parsed as a control signal", () => {
+  const ext = {
+    openclaw: {
+      type: "session_transcript_observed",
+      session: "agent:main:clawchat:group:group-42",
+      source: "control_ui_reply",
+      message_id: "observed-1",
+      message_seq: 17,
+      message_timestamp: 1710000000123,
+      message: {
+        role: "assistant",
+        content: "assistant reply",
+      },
+    },
+  };
+
+  assert.deepEqual(
+    extractSessionTranscriptObservedSignal(
+      {
+        type: "command",
+        ext: JSON.stringify(ext),
+      },
+      {},
+    ),
+    {
+      type: "session_transcript_observed",
+      session: "agent:main:clawchat:group:group-42",
+      source: "control_ui_reply",
+      role: "assistant",
+      messageId: "observed-1",
+    },
+  );
+});
+
+test("legacy session_message_sync envelope is ignored by transcript observed extractor", () => {
+  assert.equal(
+    extractSessionTranscriptObservedSignal(
+      {
+        type: "command",
+        ext: JSON.stringify({
+          openclaw: {
+            type: "session_message_sync",
+            session: "agent:main:clawchat:group:group-42",
+            source: "control_ui_reply",
+            message: {
+              role: "assistant",
+              content: "legacy reply",
+            },
+          },
+        }),
+      },
+      {},
+    ),
+    null,
+  );
+});
+
 test("non-session sync openclaw envelopes are ignored by the sync extractor", () => {
   assert.equal(
-    extractSessionMessageSyncSignal(
+    extractSessionTranscriptObservedSignal(
       {
         type: "command",
         ext: JSON.stringify({

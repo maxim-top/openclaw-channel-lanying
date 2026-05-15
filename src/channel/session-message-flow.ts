@@ -7,7 +7,7 @@ import {
   resolveClawchatSessionKeyFacts,
   extractSessionMappingSignal,
   extractSessionSyncDeliverySignal,
-  extractSessionMessageSyncSignal,
+  extractSessionTranscriptObservedSignal,
   extractText,
   isCommandOuterMessage,
   isHistoryEvent,
@@ -153,7 +153,7 @@ type MessageFlowContext = {
     account?: ResolvedClawchatAccount,
     ext?: Record<string, unknown>,
   ) => Promise<unknown>;
-  sendSessionMessageSyncToSelf: (update: {
+  sendSessionTranscriptObservedToSelf: (update: {
     sessionFile: string;
     sessionKey?: string;
     source?: string;
@@ -238,7 +238,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
     if (!shouldSeedParentSessionMapping(params.sessionKey, params.mappedSessionKey) || !senderUserId) {
       return;
     }
-    await ctx.sendSessionMessageSyncToSelf({
+    await ctx.sendSessionTranscriptObservedToSelf({
       sessionFile: params.sessionKey,
       sessionKey: params.sessionKey,
       source: "control_ui_user",
@@ -1167,9 +1167,10 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       const routerSignal = extractRouterSignal(eventAny, meta);
       const sessionMappingSignal = extractSessionMappingSignal(eventAny, meta);
       const sessionSyncDeliverySignal = extractSessionSyncDeliverySignal(eventAny, meta);
-      const sessionMessageSyncSignal = extractSessionMessageSyncSignal(eventAny, meta);
+      const sessionTranscriptObservedSignal = extractSessionTranscriptObservedSignal(eventAny, meta);
       const isCommandOuter = isCommandOuterMessage(eventAny, meta);
-      const isSessionMessageSyncControlEnvelope = sessionMessageSyncSignal && isCommandOuter;
+      const isSessionTranscriptObservedControlEnvelope =
+        sessionTranscriptObservedSignal && isCommandOuter;
       if (sessionSyncDeliverySignal) {
         logDebug("skip inbound OpenClaw delivery visible message", {
           type: sessionSyncDeliverySignal.type,
@@ -1185,31 +1186,31 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
         });
         return;
       }
-      if (sessionMessageSyncSignal && !isCommandOuter) {
-        logDebug("ignore inbound session_message_sync hint: outer type is not command", {
+      if (sessionTranscriptObservedSignal && !isCommandOuter) {
+        logDebug("ignore inbound session_transcript_observed hint: outer type is not command", {
           senderId,
           toId: toIdRaw,
           targetId,
           mode,
           selfId,
-          session: sessionMessageSyncSignal.session,
-          source: sessionMessageSyncSignal.source,
-          role: sessionMessageSyncSignal.role,
-          messageId: sessionMessageSyncSignal.messageId,
+          session: sessionTranscriptObservedSignal.session,
+          source: sessionTranscriptObservedSignal.source,
+          role: sessionTranscriptObservedSignal.role,
+          messageId: sessionTranscriptObservedSignal.messageId,
         });
       }
       if (mode === "direct" && senderId && toIdRaw && senderId === toIdRaw) {
         const isSelfLoopback = Boolean(selfId && senderId === selfId);
-        if (isSessionMessageSyncControlEnvelope) {
-          logDebug("consume loopback session_message_sync control envelope", {
+        if (isSessionTranscriptObservedControlEnvelope) {
+          logDebug("consume loopback session_transcript_observed control envelope", {
             senderId,
             toId: toIdRaw,
             selfId,
             isSelfLoopback,
-            session: sessionMessageSyncSignal.session,
-            source: sessionMessageSyncSignal.source,
-            role: sessionMessageSyncSignal.role,
-            messageId: sessionMessageSyncSignal.messageId,
+            session: sessionTranscriptObservedSignal.session,
+            source: sessionTranscriptObservedSignal.source,
+            role: sessionTranscriptObservedSignal.role,
+            messageId: sessionTranscriptObservedSignal.messageId,
           });
           return;
         }
@@ -1461,16 +1462,16 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
         });
         return;
       }
-      if (isSessionMessageSyncControlEnvelope) {
-        logDebug("skip inbound session_message_sync control envelope", {
+      if (isSessionTranscriptObservedControlEnvelope) {
+        logDebug("skip inbound session_transcript_observed control envelope", {
           senderId,
           toId: toIdRaw,
           targetId,
           mode,
-          session: sessionMessageSyncSignal.session,
-          source: sessionMessageSyncSignal.source,
-          role: sessionMessageSyncSignal.role,
-          messageId: sessionMessageSyncSignal.messageId,
+          session: sessionTranscriptObservedSignal.session,
+          source: sessionTranscriptObservedSignal.source,
+          role: sessionTranscriptObservedSignal.role,
+          messageId: sessionTranscriptObservedSignal.messageId,
         });
         return;
       }

@@ -100,7 +100,7 @@ function createMessageFlowHarness(options?: {
       texts.push({ target, text, ext: ext as Record<string, unknown> | undefined });
       return "msg-1";
     },
-    sendSessionMessageSyncToSelf: async (update) => {
+    sendSessionTranscriptObservedToSelf: async (update) => {
       seededSyncs.push(update as Record<string, unknown>);
     },
     resolveSessionMapping: () =>
@@ -130,10 +130,10 @@ function createMessageFlowHarness(options?: {
   };
 }
 
-function createSessionMessageSyncExt() {
+function createSessionTranscriptObservedExt() {
   return JSON.stringify({
     openclaw: {
-      type: "session_message_sync",
+      type: "session_transcript_observed",
       session: "agent:main:clawchat-router:group:group-42",
       source: "control_ui_reply",
       messageId: "sync-reply-1",
@@ -195,7 +195,7 @@ function createImReplyDeliveryExt() {
   });
 }
 
-test("self loopback session_message_sync command is consumed as a control envelope", async () => {
+test("self loopback session_transcript_observed command is consumed as a control envelope", async () => {
   const harness = createMessageFlowHarness();
 
   await harness.flow.onInbound(
@@ -206,7 +206,7 @@ test("self loopback session_message_sync command is consumed as a control envelo
       type: "command",
       toType: "roster",
       content: "must not dispatch",
-      ext: createSessionMessageSyncExt(),
+      ext: createSessionTranscriptObservedExt(),
       timestamp: 1001,
     },
     "direct",
@@ -219,7 +219,7 @@ test("self loopback session_message_sync command is consumed as a control envelo
   assert.equal(harness.routerReplies.length, 0);
 });
 
-test("non-command session_message_sync loopback is dropped before normal inbound", async () => {
+test("non-command session_transcript_observed loopback is dropped before normal inbound", async () => {
   const harness = createMessageFlowHarness();
 
   await harness.flow.onInbound(
@@ -230,7 +230,7 @@ test("non-command session_message_sync loopback is dropped before normal inbound
       type: "text",
       toType: "roster",
       content: "must not dispatch",
-      ext: createSessionMessageSyncExt(),
+      ext: createSessionTranscriptObservedExt(),
       timestamp: 1002,
     },
     "direct",
@@ -242,7 +242,7 @@ test("non-command session_message_sync loopback is dropped before normal inbound
   assert.equal(harness.texts.length, 0);
 });
 
-test("non-self session_message_sync envelope is not treated as user text", async () => {
+test("non-self session_transcript_observed envelope is not treated as user text", async () => {
   const harness = createMessageFlowHarness();
 
   await harness.flow.onInbound(
@@ -253,7 +253,7 @@ test("non-self session_message_sync envelope is not treated as user text", async
       type: "command",
       toType: "roster",
       content: "must not dispatch",
-      ext: createSessionMessageSyncExt(),
+      ext: createSessionTranscriptObservedExt(),
       timestamp: 1003,
     },
     "direct",
@@ -265,7 +265,7 @@ test("non-self session_message_sync envelope is not treated as user text", async
   assert.equal(harness.texts.length, 0);
 });
 
-test("non-command inbound keeps normal processing even when ext carries session_message_sync hint", async () => {
+test("non-command inbound keeps normal processing even when ext carries session_transcript_observed hint", async () => {
   const harness = createMessageFlowHarness();
 
   await harness.flow.onInbound(
@@ -276,7 +276,7 @@ test("non-command inbound keeps normal processing even when ext carries session_
       type: "text",
       toType: "roster",
       content: "hello from im",
-      ext: createSessionMessageSyncExt(),
+      ext: createSessionTranscriptObservedExt(),
       timestamp: 1004,
     },
     "direct",

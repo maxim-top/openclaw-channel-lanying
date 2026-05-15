@@ -67,8 +67,8 @@ export type SessionKeyFacts = {
   isSubagent: boolean;
 };
 
-export type SessionMessageSyncSignal = {
-  type: "session_message_sync";
+export type SessionTranscriptObservedSignal = {
+  type: "session_transcript_observed";
   session?: string;
   source?: string;
   role?: string;
@@ -423,10 +423,10 @@ export function extractSessionMappingSignal(
   return null;
 }
 
-export function extractSessionMessageSyncSignal(
+export function extractSessionTranscriptObservedSignal(
   eventAny: Record<string, unknown>,
   meta: Record<string, unknown>,
-): SessionMessageSyncSignal | null {
+): SessionTranscriptObservedSignal | null {
   const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
   const extObjCandidates = [
     parseExtValue(eventAny.ext),
@@ -440,12 +440,13 @@ export function extractSessionMessageSyncSignal(
       continue;
     }
     const openclawObj = openclaw as Record<string, unknown>;
-    if (String(openclawObj.type ?? "").trim() !== "session_message_sync") {
+    const signalType = String(openclawObj.type ?? "").trim();
+    if (signalType !== "session_transcript_observed") {
       continue;
     }
     const message = parseMetaMessage(openclawObj.message);
     return {
-      type: "session_message_sync",
+      type: "session_transcript_observed",
       session: String(openclawObj.session ?? openclawObj.sessionKey ?? "").trim() || undefined,
       source: String(openclawObj.source ?? "").trim() || undefined,
       role: String(message?.role ?? "").trim() || undefined,
