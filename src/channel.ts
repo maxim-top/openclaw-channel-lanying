@@ -1898,6 +1898,7 @@ class ClawchatSession {
     observedChannel?: string;
     observedMessageType?: string;
     observedMessageTypeSource?: string;
+    suppressionReason?: string;
   }): Promise<void> {
     if (!this.client || !this.selfId || !this.client.isLogin?.()) {
       return;
@@ -1955,7 +1956,10 @@ class ClawchatSession {
         ? update.syncVariant.trim()
         : undefined;
     const normalizedRole = typeof role === "string" ? role.trim().toLowerCase() : "";
-    let suppressionReason: string | undefined;
+    let suppressionReason =
+      typeof update.suppressionReason === "string" && update.suppressionReason.trim()
+        ? update.suppressionReason.trim()
+        : undefined;
     if (normalizedSource === "control_ui_reply" && normalizedRole === "assistant") {
       const extractedText = extractSessionSyncText(content).trim();
       const parentSuppression = this.shouldSuppressParentAssistantReplyAfterSubagent({

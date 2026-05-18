@@ -53,6 +53,7 @@ type SessionTranscriptUpdate = {
   syncVariant?: SessionSyncVariant;
   observedMessageType?: string;
   observedMessageTypeSource?: string;
+  suppressionReason?: string;
 };
 
 type SessionLoggerSnapshot = {
@@ -65,6 +66,16 @@ type SessionLoggerSnapshot = {
   bodyPreview?: string;
 };
 
+type TranscriptClassification = {
+  sessionIdentity: string;
+  role: string;
+  source: SessionMessageSyncSource | null;
+  syncVariant: SessionSyncVariant | null;
+  suppressionReason: string | null;
+  currentMessageSyncVariant: SessionSyncVariant | null;
+  message: Record<string, unknown> | null;
+};
+
 type SessionLoggerInstallOptions = {
   onSessionTranscriptUpdate?: (update: SessionTranscriptUpdate) => void | Promise<void>;
 };
@@ -73,6 +84,7 @@ const recentUpdateKeys = new Map<string, number>();
 const recentObservedMessageIds = new Map<string, { seenAt: number; count: number }>();
 const recentSessionSources = new Map<string, { source: RememberedSessionSource; seenAt: number }>();
 const recentSessionSyncVariants = new Map<string, { variant: SessionSyncVariant; seenAt: number }>();
+const recentInternalRuntimeContexts = new Map<string, { seenAt: number }>();
 const recentForwardedControlUiUsers = new Map<
   string,
   { normalizedText: string; seenAt: number; messageId?: string }
@@ -98,6 +110,11 @@ function cleanupRecentState(now = Date.now()): void {
   for (const [key, entry] of recentSessionSyncVariants.entries()) {
     if (now - entry.seenAt > SESSION_SOURCE_TTL_MS) {
       recentSessionSyncVariants.delete(key);
+    }
+  }
+  for (const [key, entry] of recentInternalRuntimeContexts.entries()) {
+    if (now - entry.seenAt > SESSION_SOURCE_TTL_MS) {
+      recentInternalRuntimeContexts.delete(key);
     }
   }
   for (const [key, entry] of recentForwardedControlUiUsers.entries()) {
@@ -178,10 +195,36 @@ function rememberSessionSource(
   source: RememberedSessionSource | null,
   now = Date.now(),
 ): void {
-  if (!sessionIdentity || !source) {
+  if (!sessionIdentity) {
+    return;
+  }
+  if (!source) {
+    recentSessionSources.delete(sessionIdentity);
     return;
   }
   recentSessionSources.set(sessionIdentity, { source, seenAt: now });
+}
+
+function rememberInternalRuntimeContext(sessionIdentity: string, now = Date.now()): void {
+  if (!sessionIdentity) {
+    return;
+  }
+  recentInternalRuntimeContexts.set(sessionIdentity, { seenAt: now });
+}
+
+function hasRecentInternalRuntimeContext(sessionIdentity: string, now = Date.now()): boolean {
+  if (!sessionIdentity) {
+    return false;
+  }
+  cleanupRecentState(now);
+  return recentInternalRuntimeContexts.has(sessionIdentity);
+}
+
+function clearInternalRuntimeContext(sessionIdentity: string): void {
+  if (!sessionIdentity) {
+    return;
+  }
+  recentInternalRuntimeContexts.delete(sessionIdentity);
 }
 
 function resolveRememberedSessionSource(
@@ -642,44 +685,114 @@ function shouldSuppressDuplicatedControlUiUser(update: SessionTranscriptUpdate):
   );
 }
 
-function resolveUpdateSyncSource(update: SessionTranscriptUpdate): SessionMessageSyncSource | null {
+function classifyTranscriptUpdate(update: SessionTranscriptUpdate): TranscriptClassification {
   const sessionIdentity = resolveSessionIdentity(update);
   const message = asPlainObject(update.message);
+  const role = normalizeHint(message?.role ?? message?.authorRole);
+  const currentMessageSyncVariant = resolveCurrentMessageSyncVariant(sessionIdentity, message);
+  const syncVariant =
+    extractSyncVariant(update.syncVariant) ||
+    extractMessageSyncVariant(message) ||
+    (role === "assistant"
+      ? consumeRememberedSessionSyncVariant(sessionIdentity)
+      : currentMessageSyncVariant);
+  const suppressionReason = resolveTranscriptSuppressionReason(sessionIdentity, role, message);
   const explicitSource = extractSyncSource(update.source) || extractMessageSyncSource(message);
   if (explicitSource) {
-    rememberSessionSource(sessionIdentity, explicitSource.startsWith("control_ui") ? "control_ui" : "im_inbound");
-    return explicitSource;
+    return {
+      sessionIdentity,
+      role,
+      source: explicitSource,
+      syncVariant,
+      suppressionReason,
+      currentMessageSyncVariant,
+      message,
+    };
   }
-  const role = normalizeHint(message?.role ?? message?.authorRole);
+  let source: SessionMessageSyncSource | null = null;
   if (role === "user") {
-    const source = resolveUserMessageSyncSource(sessionIdentity, message);
+    if (isInternalRuntimeContextUserTurn(message)) {
+      source = "control_ui_user";
+    } else {
+      source = resolveUserMessageSyncSource(sessionIdentity, message);
+    }
+  } else if (role === "assistant") {
+    if (hasRecentInternalRuntimeContext(sessionIdentity)) {
+      source = "control_ui_reply";
+    } else {
+      source = resolveReplySyncSource(sessionIdentity, message);
+    }
+  }
+  return {
+    sessionIdentity,
+    role,
+    source,
+    syncVariant,
+    suppressionReason,
+    currentMessageSyncVariant,
+    message,
+  };
+}
+
+function commitTranscriptClassification(classification: TranscriptClassification): void {
+  const { sessionIdentity, role, source, suppressionReason, currentMessageSyncVariant } = classification;
+  if (role === "user") {
+    if (suppressionReason === "internal_runtime_context") {
+      rememberSessionSource(sessionIdentity, null);
+      rememberInternalRuntimeContext(sessionIdentity);
+    } else {
+      rememberSessionSource(
+        sessionIdentity,
+        source === "control_ui_user" ? "control_ui" : source === "im_inbound_user" ? "im_inbound" : null,
+      );
+    }
+  } else if (source) {
     rememberSessionSource(
       sessionIdentity,
-      source === "control_ui_user" ? "control_ui" : source === "im_inbound_user" ? "im_inbound" : null,
+      source.startsWith("control_ui") ? "control_ui" : source.startsWith("im_inbound") ? "im_inbound" : null,
     );
-    return source;
   }
-  if (role === "assistant") {
-    return resolveReplySyncSource(sessionIdentity, message);
+  if (role === "user" || role === "assistant") {
+    rememberSessionSyncVariant(
+      sessionIdentity,
+      role === "user" ? currentMessageSyncVariant : null,
+    );
+  }
+}
+
+function resolveTranscriptSuppressionReason(
+  sessionIdentity: string,
+  role: string,
+  message: Record<string, unknown> | null,
+): string | null {
+  if (role === "user" && isInternalRuntimeContextUserTurn(message)) {
+    return "internal_runtime_context";
+  }
+  if (role === "assistant" && hasRecentInternalRuntimeContext(sessionIdentity)) {
+    return "internal_runtime_context_reply";
   }
   return null;
 }
 
-function shouldProcessUpdate(update: SessionTranscriptUpdate): boolean {
-  const syncSource = resolveUpdateSyncSource(update);
+function shouldProcessUpdate(
+  update: SessionTranscriptUpdate,
+  classification: TranscriptClassification,
+): boolean {
+  const syncSource = classification.source;
   if (syncSource !== "control_ui_user" && syncSource !== "control_ui_reply") {
     return false;
   }
-  const message = asPlainObject(update.message);
-  if (syncSource === "control_ui_user" && isInternalRuntimeContextUserTurn(message)) {
+  const sessionKey = classification.sessionIdentity;
+  const role = classification.role;
+  const suppressionReason = classification.suppressionReason;
+  if (
+    !suppressionReason &&
+    syncSource === "control_ui_user" &&
+    shouldSuppressDuplicatedControlUiUser(update)
+  ) {
     return false;
   }
-  if (syncSource === "control_ui_user" && shouldSuppressDuplicatedControlUiUser(update)) {
-    return false;
-  }
-  const sessionKey = resolveSessionIdentity(update);
-  const timestamp = Number(message?.timestamp ?? message?.createdAt ?? 0) || 0;
-  const role = normalizeHint(message?.role ?? message?.authorRole);
+  const timestamp = Number(classification.message?.timestamp ?? classification.message?.createdAt ?? 0) || 0;
   const bodyPreview = extractBodyPreview(update.message);
   const dedupeKey = [
     "transcript",
@@ -763,13 +876,16 @@ function rememberObservedMessageId(params: {
   }
 }
 
-function rememberSnapshot(update: SessionTranscriptUpdate): void {
+function rememberSnapshot(
+  update: SessionTranscriptUpdate,
+  classification?: TranscriptClassification,
+): void {
   const message = asPlainObject(update.message);
   recentSnapshots.push({
     at: Date.now(),
     sessionKey: resolveSessionIdentity(update),
     messageId: update.messageId,
-    source: resolveUpdateSyncSource(update) ?? undefined,
+    source: classification?.source ?? undefined,
     syncVariant: extractSyncVariant(update.syncVariant) ?? undefined,
     role: normalizeHint(message?.role ?? message?.authorRole) || undefined,
     bodyPreview: extractBodyPreview(update.message) || undefined,
@@ -806,6 +922,7 @@ export function resetGlobalOpenClawSessionLoggerStatus(): string {
   recentUpdateKeys.clear();
   recentSessionSources.clear();
   recentSessionSyncVariants.clear();
+  recentInternalRuntimeContexts.clear();
   recentForwardedControlUiUsers.clear();
   recentSnapshots.length = 0;
   return "ClawChat session sync status reset.";
@@ -878,23 +995,12 @@ export function installGlobalOpenClawSessionLogger(
         bodyPreview: bodyPreview || undefined,
       });
     }
-    const source = resolveUpdateSyncSource(update);
-    const currentMessageSyncVariant = resolveCurrentMessageSyncVariant(sessionIdentity, message);
-    const syncVariant =
-      extractSyncVariant(update.syncVariant) ||
-      extractMessageSyncVariant(message) ||
-      (role === "assistant"
-        ? consumeRememberedSessionSyncVariant(sessionIdentity)
-        : currentMessageSyncVariant);
-    if (role === "user" || role === "assistant") {
-      rememberSessionSyncVariant(
-        sessionIdentity,
-        role === "user" ? currentMessageSyncVariant : extractSyncVariant(update.syncVariant),
-      );
-    }
-    if (!shouldProcessUpdate(update)) {
+    const classification = classifyTranscriptUpdate(update);
+    if (!shouldProcessUpdate(update, classification)) {
       return;
     }
+    commitTranscriptClassification(classification);
+    const { source, suppressionReason, syncVariant } = classification;
     const nextUpdate = source
       ? {
           ...update,
@@ -905,13 +1011,22 @@ export function installGlobalOpenClawSessionLogger(
           ...(source === "control_ui_reply" ? { observedMessageType: "control_ui_reply" } : {}),
           ...(source === "im_inbound_user" ? { observedMessageType: "im_inbound_user" } : {}),
           ...(source === "im_inbound_reply" ? { observedMessageType: "im_inbound_reply" } : {}),
+          ...(suppressionReason
+            ? {
+                suppressionReason,
+                observedMessageType: suppressionReason,
+                observedMessageTypeSource: "plugin_suppression",
+              }
+            : {}),
           ...(role === "user"
             ? {
                 observedMessageTypeSource:
-                  syncVariant === "im_subagent_bootstrap"
+                  suppressionReason
+                    ? "plugin_suppression"
+                    : syncVariant === "im_subagent_bootstrap"
                     ? "fallback"
                     : resolveCurrentMessageUserSyncSourceBasis(
-                        resolveSessionIdentity(update),
+                        sessionIdentity,
                         message,
                         source,
                       ) ?? undefined,
@@ -919,8 +1034,11 @@ export function installGlobalOpenClawSessionLogger(
             : {}),
         }
       : update;
-    rememberSnapshot(nextUpdate);
+    rememberSnapshot(nextUpdate, classification);
     void options.onSessionTranscriptUpdate?.(nextUpdate);
+    if (suppressionReason === "internal_runtime_context_reply") {
+      clearInternalRuntimeContext(sessionIdentity);
+    }
   });
 
   const dispose = () => {

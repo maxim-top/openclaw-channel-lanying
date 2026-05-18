@@ -148,7 +148,7 @@ test("subagent bootstrap without provenance is marked as fallback control_ui_use
   assert.equal(harness.forwarded[0]?.observedMessageTypeSource, "fallback");
 });
 
-test("internal runtime context user turn is not forwarded to IM", async () => {
+test("internal runtime context user turn is marked for connector suppression", async () => {
   const harness = installForwardCollector();
 
   harness.emit({
@@ -172,10 +172,14 @@ test("internal runtime context user turn is not forwarded to IM", async () => {
   });
 
   harness.dispose();
-  assert.equal(harness.forwarded.length, 0);
+  assert.equal(harness.forwarded.length, 1);
+  assert.equal(harness.forwarded[0]?.source, "control_ui_user");
+  assert.equal(harness.forwarded[0]?.observedMessageType, "internal_runtime_context");
+  assert.equal(harness.forwarded[0]?.observedMessageTypeSource, "plugin_suppression");
+  assert.equal(harness.forwarded[0]?.suppressionReason, "internal_runtime_context");
 });
 
-test("structured inter-session subagent announce user turn is not forwarded to IM", async () => {
+test("structured inter-session subagent announce user turn is marked for connector suppression", async () => {
   const harness = installForwardCollector();
 
   harness.emit({
@@ -198,10 +202,14 @@ test("structured inter-session subagent announce user turn is not forwarded to I
   });
 
   harness.dispose();
-  assert.equal(harness.forwarded.length, 0);
+  assert.equal(harness.forwarded.length, 1);
+  assert.equal(harness.forwarded[0]?.source, "control_ui_user");
+  assert.equal(harness.forwarded[0]?.observedMessageType, "internal_runtime_context");
+  assert.equal(harness.forwarded[0]?.observedMessageTypeSource, "plugin_suppression");
+  assert.equal(harness.forwarded[0]?.suppressionReason, "internal_runtime_context");
 });
 
-test("internal system provenance user turn is not forwarded to IM", async () => {
+test("internal system provenance user turn is marked for connector suppression", async () => {
   const harness = installForwardCollector();
 
   harness.emit({
@@ -218,10 +226,14 @@ test("internal system provenance user turn is not forwarded to IM", async () => 
   });
 
   harness.dispose();
-  assert.equal(harness.forwarded.length, 0);
+  assert.equal(harness.forwarded.length, 1);
+  assert.equal(harness.forwarded[0]?.source, "control_ui_user");
+  assert.equal(harness.forwarded[0]?.observedMessageType, "internal_runtime_context");
+  assert.equal(harness.forwarded[0]?.observedMessageTypeSource, "plugin_suppression");
+  assert.equal(harness.forwarded[0]?.suppressionReason, "internal_runtime_context");
 });
 
-test("assistant reply after internal runtime context still forwards to IM", async () => {
+test("assistant reply after internal runtime context is marked for connector suppression", async () => {
   const harness = installForwardCollector();
 
   harness.emit({
@@ -256,13 +268,14 @@ test("assistant reply after internal runtime context still forwards to IM", asyn
   });
 
   harness.dispose();
-  assert.deepEqual(
-    harness.forwarded.map((update) => update.source),
-    ["control_ui_reply"],
-  );
+  assert.equal(harness.forwarded.length, 2);
+  assert.equal(harness.forwarded[1]?.source, "control_ui_reply");
+  assert.equal(harness.forwarded[1]?.observedMessageType, "internal_runtime_context_reply");
+  assert.equal(harness.forwarded[1]?.observedMessageTypeSource, "plugin_suppression");
+  assert.equal(harness.forwarded[1]?.suppressionReason, "internal_runtime_context_reply");
 });
 
-test("assistant reply after structured inter-session subagent announce still forwards to IM", async () => {
+test("assistant reply after structured inter-session subagent announce is marked for connector suppression", async () => {
   const harness = installForwardCollector();
 
   harness.emit({
@@ -294,13 +307,14 @@ test("assistant reply after structured inter-session subagent announce still for
   });
 
   harness.dispose();
-  assert.deepEqual(
-    harness.forwarded.map((update) => update.source),
-    ["control_ui_reply"],
-  );
+  assert.equal(harness.forwarded.length, 2);
+  assert.equal(harness.forwarded[1]?.source, "control_ui_reply");
+  assert.equal(harness.forwarded[1]?.observedMessageType, "internal_runtime_context_reply");
+  assert.equal(harness.forwarded[1]?.observedMessageTypeSource, "plugin_suppression");
+  assert.equal(harness.forwarded[1]?.suppressionReason, "internal_runtime_context_reply");
 });
 
-test("assistant reply after internal system provenance user turn still forwards to IM", async () => {
+test("assistant reply after internal system provenance user turn is marked for connector suppression", async () => {
   const harness = installForwardCollector();
 
   harness.emit({
@@ -325,10 +339,11 @@ test("assistant reply after internal system provenance user turn still forwards 
   });
 
   harness.dispose();
-  assert.deepEqual(
-    harness.forwarded.map((update) => update.source),
-    ["control_ui_reply"],
-  );
+  assert.equal(harness.forwarded.length, 2);
+  assert.equal(harness.forwarded[1]?.source, "control_ui_reply");
+  assert.equal(harness.forwarded[1]?.observedMessageType, "internal_runtime_context_reply");
+  assert.equal(harness.forwarded[1]?.observedMessageTypeSource, "plugin_suppression");
+  assert.equal(harness.forwarded[1]?.suppressionReason, "internal_runtime_context_reply");
 });
 
 test("legacy router session keys are treated as clawchat-router sessions", async () => {
