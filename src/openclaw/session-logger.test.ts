@@ -103,7 +103,7 @@ test("normal control UI user turns without provenance do not get fallback basis"
   assert.equal(harness.forwarded[0]?.observedMessageTypeSource, undefined);
 });
 
-test("OpenClaw prompt context envelope for an IM-origin current message is not forwarded", async () => {
+test("OpenClaw prompt context envelope for an IM-origin current message is marked for connector suppression", async () => {
   const harness = installForwardCollector();
 
   harness.emit({
@@ -125,7 +125,49 @@ test("OpenClaw prompt context envelope for an IM-origin current message is not f
   });
 
   harness.dispose();
-  assert.equal(harness.forwarded.length, 0);
+  assert.equal(harness.forwarded.length, 1);
+  assert.equal(harness.forwarded[0]?.source, "control_ui_user");
+  assert.equal(harness.forwarded[0]?.observedMessageType, "prompt_context_envelope");
+  assert.equal(harness.forwarded[0]?.observedMessageTypeSource, "plugin_suppression");
+  assert.equal(harness.forwarded[0]?.suppressionReason, "prompt_context_envelope");
+});
+
+test("OpenClaw prompt context envelope in a subagent bootstrap turn is marked for connector suppression", async () => {
+  const harness = installForwardCollector();
+
+  harness.emit({
+    sessionFile: "agent:main:subagent:child-with-bootstrap-knowledge-context",
+    messageId: "knowledge-bootstrap-user-1",
+    message: {
+      role: "user",
+      content: [
+        "[Retrieved knowledge context]",
+        "internal knowledge should not be visible",
+        "[End knowledge context]",
+        "[Group context messages since last trigger]",
+        "[AI] prior result",
+        "",
+        "[Current message]",
+        "@chatbot_qkyimzwkzd 你好",
+        "",
+        "[Subagent Context] You are running as a subagent (depth 1/1). Results auto-announce to your requester; do not busy-poll for status.",
+        "",
+        "Begin. Your assigned task is in the system prompt under Your Role; execute it to completion.",
+      ].join("\n"),
+      InputProvenance: {
+        kind: "external_user",
+        sourceChannel: "clawchat",
+        sourceTool: "clawchat_router",
+      },
+    },
+  });
+
+  harness.dispose();
+  assert.equal(harness.forwarded.length, 1);
+  assert.equal(harness.forwarded[0]?.source, "control_ui_user");
+  assert.equal(harness.forwarded[0]?.observedMessageType, "prompt_context_envelope");
+  assert.equal(harness.forwarded[0]?.observedMessageTypeSource, "plugin_suppression");
+  assert.equal(harness.forwarded[0]?.suppressionReason, "prompt_context_envelope");
 });
 
 test("subagent bootstrap without provenance is marked as fallback control_ui_user", async () => {

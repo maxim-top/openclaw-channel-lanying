@@ -610,6 +610,14 @@ function hasInjectedMetadataEnvelope(text: string): boolean {
   );
 }
 
+function hasOpenClawPromptContextEnvelope(text: string): boolean {
+  if (!text) {
+    return false;
+  }
+  const normalized = text.trim();
+  return OPENCLAW_PROMPT_CONTEXT_SENTINELS.some((sentinel) => normalized.includes(sentinel));
+}
+
 function extractMessageVisibleText(value: unknown): string {
   if (typeof value === "string") {
     return value;
@@ -651,15 +659,15 @@ function shouldSuppressDuplicatedControlUiUser(update: SessionTranscriptUpdate):
     return false;
   }
   const message = asPlainObject(update.message);
-  if (isSubagentBootstrapUserTurn(sessionIdentity, message)) {
-    return false;
-  }
   const rawVisibleText = extractMessageVisibleText(message?.content);
   const strippedVisibleText = normalizeVisibleUserText(rawVisibleText);
   if (!strippedVisibleText) {
     return false;
   }
   const injectedEnvelope = hasInjectedMetadataEnvelope(rawVisibleText);
+  if (isSubagentBootstrapUserTurn(sessionIdentity, message)) {
+    return hasOpenClawPromptContextEnvelope(rawVisibleText);
+  }
   const now = Date.now();
   cleanupRecentState(now);
   const previous = recentForwardedControlUiUsers.get(sessionIdentity);
@@ -765,6 +773,12 @@ function resolveTranscriptSuppressionReason(
   role: string,
   message: Record<string, unknown> | null,
 ): string | null {
+  if (
+    role === "user" &&
+    hasOpenClawPromptContextEnvelope(extractMessageVisibleText(message?.content))
+  ) {
+    return "prompt_context_envelope";
+  }
   if (role === "user" && isInternalRuntimeContextUserTurn(message)) {
     return "internal_runtime_context";
   }

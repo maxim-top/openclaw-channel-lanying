@@ -394,6 +394,66 @@ export function shouldSeedSessionMappingFromLocalStoreEntry(params: {
   return true;
 }
 
+export function resolveRouterDeliverySessionKey(params: {
+  rawTarget: string;
+  appId: string;
+  openclawUserId: string;
+  resolveSessionMapping?: (params: {
+    appId: string;
+    openclawUserId: string;
+    groupId: string;
+  }) => { sessionKey: string; effectiveTargetSessionKey?: string } | null;
+}): string | undefined {
+  const target = parseRouterDeliveryTarget(params.rawTarget);
+  if (!target) {
+    return undefined;
+  }
+  if (target.kind === "group") {
+    const mapped = params.resolveSessionMapping?.({
+      appId: params.appId,
+      openclawUserId: params.openclawUserId,
+      groupId: target.id,
+    });
+    const mappedSessionKey =
+      normalizeClawchatSessionKey(mapped?.effectiveTargetSessionKey ?? "") ||
+      normalizeClawchatSessionKey(mapped?.sessionKey ?? "");
+    if (mappedSessionKey) {
+      return mappedSessionKey;
+    }
+    return normalizeClawchatSessionKey(`agent:main:clawchat-router:group:${target.id}`);
+  }
+  return normalizeClawchatSessionKey(`agent:main:clawchat-router:direct:${target.id}`);
+}
+
+export function resolveTranscriptVisibleDeliveryOwnership(params: {
+  sessionKey: string;
+  source?: string;
+  role: string;
+  parentSessionKey?: string;
+  rootSessionKey?: string;
+  hasPluginVisibleDeliveryFact?: boolean;
+}): { owner: "plugin" | "connector"; reason: string } {
+  const normalizedSessionKey = normalizeClawchatSessionKey(params.sessionKey);
+  const sessionFacts = resolveClawchatSessionKeyFacts(normalizedSessionKey);
+  const isRootSession =
+    (!params.parentSessionKey || params.parentSessionKey === sessionFacts.canonicalSessionKey) &&
+    (!params.rootSessionKey || params.rootSessionKey === sessionFacts.canonicalSessionKey);
+  const isAssistantReply =
+    params.source === "control_ui_reply" && params.role === "assistant";
+  if (
+    isAssistantReply &&
+    sessionFacts.isClawchatSession &&
+    !sessionFacts.isSubagent &&
+    isRootSession
+  ) {
+    return { owner: "plugin", reason: "normal_channel_reply" };
+  }
+  if (isAssistantReply && params.hasPluginVisibleDeliveryFact) {
+    return { owner: "plugin", reason: "plugin_visible_delivery" };
+  }
+  return { owner: "connector", reason: "transcript_sync" };
+}
+
 // Main plugin session orchestrator.
 class ClawchatSession {
   private client: ClawchatImClient | null = null;
@@ -435,6 +495,8 @@ class ClawchatSession {
       updatedAt: number;
     }
   >();
+  private pluginVisibleDeliveryFactByKey = new Map<string, number>();
+  private pluginVisibleDeliveryWaitersByKey = new Map<string, Set<() => void>>();
   private sessionMappingBySessionKey = new Map<
     string,
     {
@@ -582,14 +644,14 @@ class ClawchatSession {
   }
 
   private deriveRouterTargetSessionKey(rawTarget: string): string | undefined {
-    const target = parseRouterDeliveryTarget(rawTarget);
-    if (!target) {
-      return undefined;
-    }
-    if (target.kind === "group") {
-      return this.normalizeOptionalSessionKey(`agent:main:clawchat-router:group:${target.id}`);
-    }
-    return this.normalizeOptionalSessionKey(`agent:main:clawchat-router:direct:${target.id}`);
+    return this.normalizeOptionalSessionKey(
+      resolveRouterDeliverySessionKey({
+        rawTarget,
+        appId: this.lastConfig?.appId ?? "",
+        openclawUserId: this.selfId,
+        resolveSessionMapping: (params) => this.resolveSessionMapping(params),
+      }),
+    );
   }
 
   private rememberSessionSyncVariant(sessionKey: string, syncVariant?: string): void {
@@ -738,6 +800,109 @@ class ClawchatSession {
     }
     this.pruneRecentTriggerMsgIds();
     return this.recentTriggerMsgIdBySessionKey.get(normalizedSessionKey)?.msgId;
+  }
+
+  private buildPluginVisibleDeliveryFactKeys(params: {
+    sessionKey: string;
+    text: string;
+    requestMsgId?: string;
+  }): string[] {
+    const normalizedSessionKey = this.normalizeOptionalSessionKey(params.sessionKey);
+    const normalizedText = extractSessionSyncText(params.text).trim();
+    const normalizedRequestMsgId =
+      typeof params.requestMsgId === "string" ? params.requestMsgId.trim() : "";
+    if (!normalizedSessionKey || !normalizedText) {
+      return [];
+    }
+    const baseKey = `${normalizedSessionKey}\u0000${normalizedText}`;
+    return normalizedRequestMsgId ? [`${baseKey}\u0000${normalizedRequestMsgId}`, baseKey] : [baseKey];
+  }
+
+  private cleanupPluginVisibleDeliveryFacts(now = Date.now()): void {
+    const ttlMs = 10 * 60 * 1000;
+    for (const [key, updatedAt] of this.pluginVisibleDeliveryFactByKey.entries()) {
+      if (now - updatedAt > ttlMs) {
+        this.pluginVisibleDeliveryFactByKey.delete(key);
+      }
+    }
+  }
+
+  rememberPluginVisibleDeliveryFact(params: {
+    sessionKey?: string;
+    text: string;
+    requestMsgId?: string;
+  }): void {
+    const sessionKey = this.normalizeOptionalSessionKey(params.sessionKey);
+    if (!sessionKey) {
+      return;
+    }
+    const keys = this.buildPluginVisibleDeliveryFactKeys({
+      sessionKey,
+      text: params.text,
+      requestMsgId: params.requestMsgId,
+    });
+    if (keys.length === 0) {
+      return;
+    }
+    const now = Date.now();
+    for (const key of keys) {
+      this.pluginVisibleDeliveryFactByKey.set(key, now);
+      const waiters = this.pluginVisibleDeliveryWaitersByKey.get(key);
+      if (waiters) {
+        this.pluginVisibleDeliveryWaitersByKey.delete(key);
+        for (const resolve of waiters) {
+          resolve();
+        }
+      }
+    }
+    this.cleanupPluginVisibleDeliveryFacts(now);
+  }
+
+  private hasPluginVisibleDeliveryFact(params: {
+    sessionKey: string;
+    text: string;
+    requestMsgId?: string;
+  }): boolean {
+    const keys = this.buildPluginVisibleDeliveryFactKeys(params);
+    if (keys.length === 0) {
+      return false;
+    }
+    this.cleanupPluginVisibleDeliveryFacts();
+    return keys.some((key) => this.pluginVisibleDeliveryFactByKey.has(key));
+  }
+
+  private async waitForPluginVisibleDeliveryFact(params: {
+    sessionKey: string;
+    text: string;
+    requestMsgId?: string;
+  }): Promise<boolean> {
+    if (this.hasPluginVisibleDeliveryFact(params)) {
+      return true;
+    }
+    const keys = this.buildPluginVisibleDeliveryFactKeys(params);
+    if (keys.length === 0) {
+      return false;
+    }
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(resolve, 750);
+      const done = () => {
+        clearTimeout(timeout);
+        for (const key of keys) {
+          const waiters = this.pluginVisibleDeliveryWaitersByKey.get(key);
+          waiters?.delete(done);
+          if (waiters && waiters.size === 0) {
+            this.pluginVisibleDeliveryWaitersByKey.delete(key);
+          }
+        }
+        resolve();
+      };
+      for (const key of keys) {
+        const waiters = this.pluginVisibleDeliveryWaitersByKey.get(key) ?? new Set<() => void>();
+        waiters.add(done);
+        this.pluginVisibleDeliveryWaitersByKey.set(key, waiters);
+      }
+    });
+    return this.hasPluginVisibleDeliveryFact(params);
   }
 
   private resolveLocalTriggerMsgIdFromSessions(
@@ -1876,6 +2041,11 @@ class ClawchatSession {
       }),
       { suppressionReason },
     );
+    this.rememberPluginVisibleDeliveryFact({
+      sessionKey: routeSessionKey,
+      text,
+      requestMsgId,
+    });
     return {
       messageId,
       suppressed: Boolean(suppressionReason),
@@ -1888,29 +2058,6 @@ class ClawchatSession {
       this.transcriptObservedSeq = 1;
     }
     return this.transcriptObservedSeq;
-  }
-
-  private resolveTranscriptVisibleDeliveryOwnership(params: {
-    sessionKey: string;
-    source?: string;
-    role: string;
-    parentSessionKey?: string;
-    rootSessionKey?: string;
-  }): { owner: "plugin" | "connector"; reason: string } {
-    const sessionFacts = resolveClawchatSessionKeyFacts(params.sessionKey);
-    const isRootSession =
-      (!params.parentSessionKey || params.parentSessionKey === sessionFacts.canonicalSessionKey) &&
-      (!params.rootSessionKey || params.rootSessionKey === sessionFacts.canonicalSessionKey);
-    if (
-      params.source === "control_ui_reply" &&
-      params.role === "assistant" &&
-      sessionFacts.isClawchatSession &&
-      !sessionFacts.isSubagent &&
-      isRootSession
-    ) {
-      return { owner: "plugin", reason: "normal_channel_reply" };
-    }
-    return { owner: "connector", reason: "transcript_sync" };
   }
 
   async sendSessionTranscriptObservedToSelf(update: {
@@ -2069,12 +2216,23 @@ class ClawchatSession {
       this.rememberSessionSyncVariant(normalizedSessionKey, undefined);
     }
     const triggerMsgId = await this.resolveLocalTriggerMsgId(normalizedSessionKey, payloadLineage);
-    const visibleDeliveryOwnership = this.resolveTranscriptVisibleDeliveryOwnership({
+    const hasPluginVisibleDeliveryFact =
+      normalizedSource === "control_ui_reply" &&
+      normalizedRole === "assistant" &&
+      !suppressionReason
+        ? await this.waitForPluginVisibleDeliveryFact({
+            sessionKey: normalizedSessionKey,
+            text: extractSessionSyncText(content).trim(),
+            requestMsgId: triggerMsgId,
+          })
+        : false;
+    const visibleDeliveryOwnership = resolveTranscriptVisibleDeliveryOwnership({
       sessionKey: normalizedSessionKey,
       source: normalizedSource,
       role: normalizedRole,
       parentSessionKey: payloadLineage.parentSessionKey,
       rootSessionKey: payloadLineage.rootSessionKey,
+      hasPluginVisibleDeliveryFact,
     });
     const normalizedPayload = {
       session: normalizedSessionKey,
@@ -2879,6 +3037,11 @@ export const clawchatPlugin: any = {
           role: "ai",
           ai_generate: false,
         },
+      });
+      session.rememberPluginVisibleDeliveryFact({
+        sessionKey: deliveryContext.sessionKey,
+        text,
+        requestMsgId: deliveryContext.requestMsgId,
       });
       return {
         channel: CLAWCHAT_CHANNEL_ID,
