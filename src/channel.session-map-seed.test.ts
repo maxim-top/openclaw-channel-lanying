@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  resolvePluginVisibleDeliveryFactFromExt,
   resolveTranscriptVisibleDeliveryOwnership,
   resolveRouterDeliverySessionKey,
   shouldSeedSessionMappingFromLocalStoreEntry,
@@ -119,4 +120,45 @@ test("subagent assistant transcript without plugin delivery fact stays connector
 
   assert.equal(ownership.owner, "connector");
   assert.equal(ownership.reason, "transcript_sync");
+});
+
+test("plugin-owned session_sync_delivery ext produces a visible delivery fact", () => {
+  const fact = resolvePluginVisibleDeliveryFactFromExt({
+    text: "你好！有什么我可以帮忙的？",
+    ext: {
+      openclaw: {
+        type: "session_sync_delivery",
+        session: "agent:main:clawchat:group:6610620069649",
+        source: "control_ui_reply",
+        role: "assistant",
+        visible_delivery_owner: "plugin",
+        trigger_msg_id: "1552747048460091409",
+        request_msg_id: "1552747048460091409",
+      },
+      ai: { role: "ai", ai_generate: false },
+    },
+  });
+
+  assert.deepEqual(fact, {
+    sessionKey: "agent:main:clawchat:group:6610620069649",
+    text: "你好！有什么我可以帮忙的？",
+    requestMsgId: "1552747048460091409",
+  });
+});
+
+test("connector-owned session_sync_delivery ext does not produce a plugin delivery fact", () => {
+  const fact = resolvePluginVisibleDeliveryFactFromExt({
+    text: "你好！有什么我可以帮忙的？",
+    ext: {
+      openclaw: {
+        type: "session_sync_delivery",
+        session: "agent:main:clawchat:group:6610620069649",
+        source: "control_ui_reply",
+        role: "assistant",
+      },
+      ai: { ai_generate: false },
+    },
+  });
+
+  assert.equal(fact, null);
 });

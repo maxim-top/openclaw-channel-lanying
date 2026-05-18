@@ -441,6 +441,41 @@ export function resolveTranscriptVisibleDeliveryOwnership(params: {
   return { owner: "connector", reason: "transcript_sync" };
 }
 
+export function resolvePluginVisibleDeliveryFactFromExt(params: {
+  ext?: Record<string, unknown>;
+  text: string;
+}): { sessionKey: string; text: string; requestMsgId?: string } | null {
+  const openclaw = asPlainObject(params.ext?.openclaw);
+  if (!openclaw) {
+    return null;
+  }
+  const visibleDeliveryOwner =
+    typeof openclaw.visible_delivery_owner === "string"
+      ? openclaw.visible_delivery_owner.trim()
+      : "";
+  if (visibleDeliveryOwner !== "plugin") {
+    return null;
+  }
+  const role = typeof openclaw.role === "string" ? openclaw.role.trim().toLowerCase() : "";
+  if (role !== "" && role !== "assistant") {
+    return null;
+  }
+  const sessionKey = normalizeClawchatSessionKey(String(openclaw.session ?? ""));
+  const text = extractSessionSyncText(params.text).trim();
+  if (!sessionKey || !text) {
+    return null;
+  }
+  const requestMsgId =
+    String(openclaw.request_msg_id ?? "").trim() ||
+    String(openclaw.trigger_msg_id ?? "").trim() ||
+    String(openclaw.router_request_sid ?? "").trim();
+  return {
+    sessionKey,
+    text,
+    ...(requestMsgId ? { requestMsgId } : {}),
+  };
+}
+
 // Main plugin session orchestrator.
 class ClawchatSession {
   private client: ClawchatImClient | null = null;
@@ -2675,16 +2710,23 @@ class ClawchatSession {
       hasExt: Boolean(extRaw),
     });
 
+    let result: unknown;
     if (target.kind === "group") {
-      return await this.client.sysManage.sendGroupMessage({
+      result = await this.client.sysManage.sendGroupMessage({
         ...payload,
         gid: target.id,
       });
+    } else {
+      result = await this.client.sysManage.sendRosterMessage({
+        ...payload,
+        uid: target.id,
+      });
     }
-    return await this.client.sysManage.sendRosterMessage({
-      ...payload,
-      uid: target.id,
-    });
+    const pluginVisibleDeliveryFact = resolvePluginVisibleDeliveryFactFromExt({ ext, text });
+    if (pluginVisibleDeliveryFact) {
+      this.rememberPluginVisibleDeliveryFact(pluginVisibleDeliveryFact);
+    }
+    return result;
   }
 
   async shutdown(): Promise<void> {
