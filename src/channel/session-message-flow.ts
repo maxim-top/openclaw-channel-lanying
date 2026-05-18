@@ -567,7 +567,8 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
               source: "control_ui_reply",
               role: "assistant",
               visible_delivery_owner: "plugin",
-              request_sid: params.messageId || undefined,
+              trigger_msg_id: params.messageId || undefined,
+              request_msg_id: params.messageId || undefined,
             },
             ai: {
               role: "ai",

@@ -695,6 +695,9 @@ test("group mapped session inbound preserves origin for execution while sanitizi
   assert.equal(sentExt?.openclaw?.source, "control_ui_reply");
   assert.equal(sentExt?.openclaw?.role, "assistant");
   assert.equal(sentExt?.openclaw?.visible_delivery_owner, "plugin");
+  assert.equal(sentExt?.openclaw?.trigger_msg_id, "msg-1");
+  assert.equal(sentExt?.openclaw?.request_msg_id, "msg-1");
+  assert.equal(sentExt?.openclaw?.request_sid, undefined);
   assert.equal(sentExt?.ai?.role, "ai");
   assert.equal(sentExt?.ai?.ai_generate, false);
 });

@@ -955,7 +955,10 @@ class ClawchatSession {
     };
   }
 
-  resolveMappedOutboundGroupTarget(appId: string, rawId: string): ClawchatMessageTarget | null {
+  resolveMappedOutboundGroupDelivery(
+    appId: string,
+    rawId: string,
+  ): { target: ClawchatMessageTarget; sessionKey: string } | null {
     const groupId = rawId.trim();
     const openclawUserId = this.selfId.trim();
     if (!groupId || !openclawUserId) {
@@ -969,9 +972,40 @@ class ClawchatSession {
     if (!mapping?.sessionKey) {
       return null;
     }
+    const sessionKey =
+      this.normalizeOptionalSessionKey(mapping.effectiveTargetSessionKey) ??
+      this.normalizeSessionMappingSessionKey(mapping.sessionKey);
     return {
-      kind: "group",
-      id: groupId,
+      target: {
+        kind: "group",
+        id: groupId,
+      },
+      sessionKey,
+    };
+  }
+
+  async resolveOutboundDeliveryContext(params: {
+    appId: string;
+    rawTarget: string;
+    target: ClawchatMessageTarget;
+  }): Promise<{ sessionKey?: string; requestMsgId?: string }> {
+    const mappedGroupDelivery =
+      params.rawTarget && !params.rawTarget.includes(":")
+        ? this.resolveMappedOutboundGroupDelivery(params.appId, params.rawTarget)
+        : null;
+    const sessionKey =
+      mappedGroupDelivery?.sessionKey ??
+      this.normalizeOptionalSessionKey(
+        params.target.kind === "group"
+          ? `agent:main:clawchat:group:${params.target.id}`
+          : `agent:main:clawchat:direct:${params.target.id}`,
+      );
+    if (!sessionKey) {
+      return {};
+    }
+    return {
+      sessionKey,
+      requestMsgId: await this.resolveLocalTriggerMsgId(sessionKey),
     };
   }
 
@@ -2808,26 +2842,38 @@ export const clawchatPlugin: any = {
           ...(routerResult.suppressed ? { suppressed: true } : {}),
         };
       }
-      const mappedGroupTarget =
+      const mappedGroupDelivery =
         rawTarget && !rawTarget.includes(":")
-          ? session.resolveMappedOutboundGroupTarget(account.appId, rawTarget)
+          ? session.resolveMappedOutboundGroupDelivery(account.appId, rawTarget)
           : null;
-      if (mappedGroupTarget) {
+      if (mappedGroupDelivery) {
         logDebug("resolved bare outbound target as group", {
           to: rawTarget,
           reason: "known_session_mapping",
         });
       }
-      const target = mappedGroupTarget || normalizeTarget(to);
+      const target = mappedGroupDelivery?.target || normalizeTarget(to);
       if (!target || !target.id) {
         throw new Error(`Invalid ClawChat target: ${to}`);
       }
+      const deliveryContext = await session.resolveOutboundDeliveryContext({
+        appId: account.appId,
+        rawTarget,
+        target,
+      });
       const messageId = await session.sendText(target, text, account, {
         openclaw: {
           type: "im_reply_delivery",
+          ...(deliveryContext.sessionKey ? { session: deliveryContext.sessionKey } : {}),
           source: "im_reply",
           role: "assistant",
           visible_delivery_owner: "plugin",
+          ...(deliveryContext.requestMsgId
+            ? {
+                trigger_msg_id: deliveryContext.requestMsgId,
+                request_msg_id: deliveryContext.requestMsgId,
+              }
+            : {}),
         },
         ai: {
           role: "ai",
