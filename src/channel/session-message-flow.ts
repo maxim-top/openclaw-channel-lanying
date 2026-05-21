@@ -1,6 +1,6 @@
 import { logDebug, logError, logWarn } from "../shared/logging.js";
 import {
-  extractConfigPatchRaw,
+  extractConfigBatchSync,
   extractPresetPromptSync,
   extractSessionMapSettingsSync,
   extractRouterSignal,
@@ -14,6 +14,7 @@ import {
   removeOpenclawEdgeMention,
   stripLeadingAtMentions,
   resolveRouterReplyTargetSnapshot,
+  type ConfigBatchSyncPayload,
   type PresetPromptSyncPayload,
   type RouterReplyTargetSnapshot,
   type SessionMapSettingsPayload,
@@ -124,7 +125,6 @@ type MessageFlowContext = {
     dispatcherOptions: DispatcherOptions;
   }) => Promise<unknown>;
   sendRouterReplyToSelf: (message: Record<string, unknown>) => Promise<void>;
-  sendConfigPatchMarkerToSelf: (params: { stage: "before" | "after"; rawPatch: string }) => Promise<void>;
   sendPresetPromptSyncMarkerToSelf: (params: {
     stage: "before" | "after";
     chatbotId: string;
@@ -135,7 +135,7 @@ type MessageFlowContext = {
     sessionMapSync: boolean;
     mergeSubSessions: boolean;
   }) => Promise<void>;
-  applyOpenClawConfigPatch: (rawPatch: string) => Promise<void>;
+  applyOpenClawConfigBatchSync: (payload: ConfigBatchSyncPayload) => Promise<void>;
   handlePresetPromptSync: (params: {
     cfg: OpenClawConfig;
     chatbotId: string;
@@ -1164,7 +1164,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       }
       ctx.updateSelfIdFromClient("inbound event");
       const selfId = ctx.getSelfId();
-      const configPatchRaw = extractConfigPatchRaw(eventAny, meta);
+      const configBatchSync = extractConfigBatchSync(eventAny, meta);
       const presetPromptSync = extractPresetPromptSync(eventAny, meta);
       const sessionMapSettingsSync = extractSessionMapSettingsSync(eventAny, meta);
       const routerSignal = extractRouterSignal(eventAny, meta);
@@ -1217,31 +1217,26 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
           });
           return;
         }
-        if (isSelfLoopback && account.allowManage && configPatchRaw) {
+        if (isSelfLoopback && account.allowManage && configBatchSync) {
           try {
-            await ctx.sendConfigPatchMarkerToSelf({
-              stage: "before",
-              rawPatch: configPatchRaw,
-            });
-            await ctx.applyOpenClawConfigPatch(configPatchRaw);
-            await ctx.sendConfigPatchMarkerToSelf({
-              stage: "after",
-              rawPatch: configPatchRaw,
-            });
-            logDebug("applied config patch from self loopback message", {
+            await ctx.applyOpenClawConfigBatchSync(configBatchSync);
+            logDebug("applied config batch sync from self loopback message", {
               senderId,
               toId: toIdRaw,
-              patchBytes: Buffer.byteLength(configPatchRaw, "utf8"),
+              batchCount: configBatchSync.batchEntries.length,
+              paths: configBatchSync.batchEntries.map((entry) => entry.path),
+              restartGateway: configBatchSync.restartGateway,
             });
           } catch (err) {
-            logError("failed to apply config patch from self loopback message", {
+            logError("failed to apply config batch sync from self loopback message", {
               err,
               senderId,
               toId: toIdRaw,
               selfId,
               allowManage: account.allowManage,
-              hasConfigPatch: Boolean(configPatchRaw),
-              patchBytes: Buffer.byteLength(configPatchRaw, "utf8"),
+              batchCount: configBatchSync.batchEntries.length,
+              paths: configBatchSync.batchEntries.map((entry) => entry.path),
+              restartGateway: configBatchSync.restartGateway,
             });
           }
           return;
@@ -1459,7 +1454,6 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
           toId: toIdRaw,
           selfId,
           allowManage: account.allowManage,
-          hasConfigPatch: Boolean(configPatchRaw),
           hasPresetPromptSync: Boolean(presetPromptSync),
           routerSignalType: routerSignal?.type ?? "",
         });

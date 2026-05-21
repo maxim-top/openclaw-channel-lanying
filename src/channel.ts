@@ -12,7 +12,6 @@ import {
   sanitizeAccountForLog,
 } from "./channel/config.js";
 import {
-  collectHashCandidates,
   normalizeClawchatSessionKey,
   resolveClawchatSessionKeyFacts,
   type RouterReplyTargetSnapshot,
@@ -28,19 +27,20 @@ import {
 } from "./channel/session-message-sync.js";
 import { createClawchatSessionMessageFlow } from "./channel/session-message-flow.js";
 import {
-  findBaseHash,
-  isConfigChangedSinceLastLoadError,
-  parseJsonFromMixedText,
-  runGatewayCall,
-} from "./openclaw/gateway.js";
+  applyConfigBatchEntries,
+  buildGatewayRestartArgv,
+  createConfigBatchSyncDigest,
+  runCommandArgv,
+} from "./openclaw/config-kv.js";
 import { getClawchatRuntime } from "./runtime.js";
-import { asPlainObject, pickId, stripAnsi } from "./shared/utils.js";
+import { asPlainObject, pickId } from "./shared/utils.js";
 import { logDebug, logError, logWarn } from "./shared/logging.js";
 import {
   CLAWCHAT_CHANNEL_ID,
   CLAWCHAT_DEFAULT_ACCOUNT_ID,
   type ClawchatInboundEvent,
   type ClawchatMessageTarget,
+  type ConfigBatchEntry,
   type OpenClawConfig,
   type ResolvedClawchatAccount,
 } from "./types.js";
@@ -166,8 +166,8 @@ export function buildClawchatClientOptions(account: ResolvedClawchatAccount): Re
 }
 const RECONNECT_BASE_DELAY_MS = 2_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
-const CONFIG_PATCH_RETRY_MAX = 3;
 const CONFIG_PATCH_DEDUPE_TTL_MS = 60_000;
+const CONFIG_RESTART_DEBOUNCE_MS = 2_000;
 const SUBAGENT_PARENT_REPLY_SUPPRESSION_TTL_MS = 60_000;
 const CLAWCHAT_MANAGED_DIR = "clawchat";
 const CLAWCHAT_MANAGED_AGENTS_PATH = `${CLAWCHAT_MANAGED_DIR}/AGENTS.md`;
@@ -500,7 +500,8 @@ class ClawchatSession {
     | null = null;
   private runtimeAccountId: string | null = null;
   private configPatchQueue: Promise<void> = Promise.resolve();
-  private recentConfigPatchByDigest = new Map<string, number>();
+  private recentConfigBatchSyncByDigest = new Map<string, number>();
+  private pendingConfigRestartTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingGroupContext = new Map<
     string,
     Array<{ senderId: string; senderName?: string; body: string; timestamp: number }>
@@ -564,10 +565,9 @@ class ClawchatSession {
     dispatchReplyWithBufferedBlockDispatcher: (params) =>
       getClawchatRuntime().channel.reply.dispatchReplyWithBufferedBlockDispatcher(params),
     sendRouterReplyToSelf: (message) => this.sendRouterReplyToSelf(message),
-    sendConfigPatchMarkerToSelf: (params) => this.sendConfigPatchMarkerToSelf(params),
     sendPresetPromptSyncMarkerToSelf: (params) => this.sendPresetPromptSyncMarkerToSelf(params),
     sendSessionMapSettingsReportToSelf: (params) => this.sendSessionMapSettingsReportToSelf(params),
-    applyOpenClawConfigPatch: (rawPatch) => this.applyOpenClawConfigPatch(rawPatch),
+    applyOpenClawConfigBatchSync: (payload) => this.applyOpenClawConfigBatchSync(payload),
     handlePresetPromptSync: (params) => this.handlePresetPromptSync(params),
     handleSessionMapSettingsSync: (params) => this.handleSessionMapSettingsSync(params),
     isSessionMapSyncEnabled: (cfg) => this.isSessionMapSyncEffectivelyEnabled(cfg),
@@ -1417,86 +1417,65 @@ class ClawchatSession {
     });
   }
 
-  private async applyOpenClawConfigPatch(rawPatch: string): Promise<void> {
-    const patchBytes = Buffer.byteLength(rawPatch, "utf8");
-    const digest = createHash("sha1").update(rawPatch).digest("hex").slice(0, 16);
-    logDebug("apply config patch requested", { patchBytes, digest });
-
+  private async applyOpenClawConfigBatchSync(params: {
+    batchEntries: ConfigBatchEntry[];
+    restartGateway: boolean;
+  }): Promise<void> {
+    const digest = createConfigBatchSyncDigest(params.batchEntries);
     const work = async (): Promise<void> => {
       const now = Date.now();
-      for (const [key, ts] of this.recentConfigPatchByDigest.entries()) {
+      for (const [key, ts] of this.recentConfigBatchSyncByDigest.entries()) {
         if (now - ts > CONFIG_PATCH_DEDUPE_TTL_MS) {
-          this.recentConfigPatchByDigest.delete(key);
+          this.recentConfigBatchSyncByDigest.delete(key);
         }
       }
-      if (this.recentConfigPatchByDigest.has(digest)) {
-        logDebug("skip duplicated config patch in short window", { patchBytes, digest });
+      if (this.recentConfigBatchSyncByDigest.has(digest)) {
+        logDebug("skip duplicated config batch sync in short window", {
+          digest,
+          batchCount: params.batchEntries.length,
+          restartGateway: params.restartGateway,
+        });
         return;
       }
-
-      let lastErr: unknown = null;
-      for (let attempt = 1; attempt <= CONFIG_PATCH_RETRY_MAX; attempt += 1) {
-        try {
-          const getResult = await runGatewayCall("config.get", {});
-          logDebug("config.get result summary", {
-            attempt,
-            resultType: Array.isArray(getResult) ? "array" : typeof getResult,
-            rootKeys:
-              getResult && typeof getResult === "object" && !Array.isArray(getResult)
-                ? Object.keys(getResult as Record<string, unknown>).slice(0, 20)
-                : [],
-            hashCandidates: collectHashCandidates(getResult),
-          });
-          const baseHash = findBaseHash(getResult);
-          if (!baseHash) {
-            if (typeof getResult === "string") {
-              const cleaned = stripAnsi(getResult);
-              const hashLines = cleaned
-                .split(/\r?\n/)
-                .map((line) => line.trim())
-                .filter((line) => /hash/i.test(line))
-                .slice(0, 8)
-                .map((line) => line.slice(0, 220));
-              logWarn("config.get string output debug", {
-                attempt,
-                textBytes: Buffer.byteLength(getResult, "utf8"),
-                hasHashToken: /hash/i.test(cleaned),
-                hashLines,
-              });
-            }
-            throw new Error("Failed to read baseHash from config.get output.");
-          }
-          logDebug("resolved baseHash for config.patch", {
-            attempt,
-            baseHashPreview: baseHash.slice(0, 12),
-            baseHashLength: baseHash.length,
-          });
-          await runGatewayCall("config.patch", {
-            raw: rawPatch,
-            baseHash,
-          });
-          this.recentConfigPatchByDigest.set(digest, Date.now());
-          logDebug("config.patch call finished", { attempt, digest });
-          return;
-        } catch (err) {
-          lastErr = err;
-          if (attempt < CONFIG_PATCH_RETRY_MAX && isConfigChangedSinceLastLoadError(err)) {
-            logWarn("config.patch baseHash conflict; retrying", {
-              attempt,
-              maxAttempts: CONFIG_PATCH_RETRY_MAX,
-              digest,
-            });
-            continue;
-          }
-          throw err;
-        }
+      await applyConfigBatchEntries(params.batchEntries);
+      if (params.restartGateway) {
+        this.scheduleDebouncedConfigRestart();
       }
-      throw lastErr;
+      this.recentConfigBatchSyncByDigest.set(digest, Date.now());
     };
 
     const queued = this.configPatchQueue.then(work, work);
     this.configPatchQueue = queued.catch(() => undefined);
     await queued;
+  }
+
+  private scheduleDebouncedConfigRestart(): void {
+    if (this.shuttingDown) {
+      logDebug("skip scheduling debounced gateway restart while shutting down");
+      return;
+    }
+    if (this.pendingConfigRestartTimer) {
+      clearTimeout(this.pendingConfigRestartTimer);
+    }
+    logDebug("schedule debounced gateway restart after config update", {
+      delayMs: CONFIG_RESTART_DEBOUNCE_MS,
+    });
+    this.pendingConfigRestartTimer = setTimeout(() => {
+      this.pendingConfigRestartTimer = null;
+      if (this.shuttingDown) {
+        logDebug("skip debounced gateway restart because session is shutting down");
+        return;
+      }
+      const restartWork = async (): Promise<void> => {
+        logDebug("run debounced gateway restart after config updates");
+        await runCommandArgv(buildGatewayRestartArgv());
+      };
+      const queued = this.configPatchQueue.then(restartWork, restartWork);
+      this.configPatchQueue = queued.catch(() => undefined);
+      void queued.catch((err) => {
+        logWarn("debounced gateway restart after config updates failed", { err });
+      });
+    }, CONFIG_RESTART_DEBOUNCE_MS);
   }
 
   private resolveUserPath(input: string): string {
@@ -1636,12 +1615,7 @@ class ClawchatSession {
 
   private async ensureBootstrapExtraFilesConfigured(cfg: OpenClawConfig): Promise<void> {
     const { injectionPath } = this.resolveManagedAgentsLocation(cfg);
-    const getResult = await runGatewayCall("config.get", {});
-    const root = asPlainObject(getResult);
-    if (!root) {
-      throw new Error("config.get did not return an object");
-    }
-    const hooks = asPlainObject(root.hooks) ?? {};
+    const hooks = asPlainObject(cfg.hooks) ?? {};
     const internal = asPlainObject(hooks.internal) ?? {};
     const entries = asPlainObject(internal.entries) ?? {};
     const bootstrapEntry = asPlainObject(entries["bootstrap-extra-files"]) ?? {};
@@ -1669,21 +1643,23 @@ class ClawchatSession {
     if (alreadyConfigured) {
       return;
     }
-    const rawPatch = JSON.stringify({
-      hooks: {
-        internal: {
-          enabled: true,
-          entries: {
-            "bootstrap-extra-files": {
-              ...bootstrapEntry,
-              enabled: true,
-              paths: nextPaths,
-            },
+    await this.applyOpenClawConfigBatchSync({
+      restartGateway: true,
+      batchEntries: [
+        {
+          path: "hooks.internal.enabled",
+          value: true,
+        },
+        {
+          path: 'hooks.internal.entries["bootstrap-extra-files"]',
+          value: {
+            ...bootstrapEntry,
+            enabled: true,
+            paths: nextPaths,
           },
         },
-      },
+      ],
     });
-    await this.applyOpenClawConfigPatch(rawPatch);
     logDebug("bootstrap-extra-files ensured for managed AGENTS.md", {
       path: injectionPath,
       pathsCount: nextPaths.length,
@@ -2641,45 +2617,6 @@ class ClawchatSession {
     }
   }
 
-  private async sendConfigPatchMarkerToSelf(params: {
-    stage: "before" | "after";
-    rawPatch: string;
-  }): Promise<void> {
-    if (!this.client || !this.selfId) {
-      return;
-    }
-    const content =
-      params.stage === "before"
-        ? "ClawChat 插件正在更新配置"
-        : "ClawChat 插件已更新配置";
-    try {
-      await this.client.sysManage.sendRosterMessage({
-        type: "text",
-        uid: this.selfId,
-        content,
-        ext: JSON.stringify({
-          openclaw: {
-            type: "config_patch_marker",
-            stage: params.stage,
-            patchBytes: Buffer.byteLength(params.rawPatch, "utf8"),
-          },
-        }),
-      });
-      logDebug("sent config_patch marker message to self", {
-        stage: params.stage,
-        selfId: this.selfId,
-        patchBytes: Buffer.byteLength(params.rawPatch, "utf8"),
-      });
-    } catch (err) {
-      logWarn("failed to send config_patch marker message to self", {
-        err,
-        stage: params.stage,
-        selfId: this.selfId,
-        patchBytes: Buffer.byteLength(params.rawPatch, "utf8"),
-      });
-    }
-  }
-
   async sendText(
     target: ClawchatMessageTarget,
     text: string,
@@ -2739,6 +2676,10 @@ class ClawchatSession {
       if (this.reconnectTimer) {
         clearTimeout(this.reconnectTimer);
         this.reconnectTimer = null;
+      }
+      if (this.pendingConfigRestartTimer) {
+        clearTimeout(this.pendingConfigRestartTimer);
+        this.pendingConfigRestartTimer = null;
       }
       this.reconnectPromise = null;
       this.reconnectAttempts = 0;

@@ -58,6 +58,11 @@ export type ClawchatMessageTarget = {
   id: string;
 };
 
+export type ConfigBatchEntry = {
+  path: string;
+  value: unknown;
+};
+
 export type ClawchatInboundEvent = {
   from?: { uid?: string | number; id?: string | number } | string | number;
   to?: { uid?: string | number; id?: string | number } | string | number;

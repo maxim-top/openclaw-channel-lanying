@@ -1,6 +1,11 @@
 import { logWarn } from "../shared/logging.js";
 import { maybeParseJson, pickId } from "../shared/utils.js";
-import { type ClawchatInboundEvent } from "../types.js";
+import { type ClawchatInboundEvent, type ConfigBatchEntry } from "../types.js";
+
+export type ConfigBatchSyncPayload = {
+  batchEntries: ConfigBatchEntry[];
+  restartGateway: boolean;
+};
 
 export type PresetPromptSyncPayload = {
   chatbotId: string;
@@ -187,10 +192,45 @@ export function stripLeadingAtMentions(content: string): string {
   }
 }
 
-export function extractConfigPatchRaw(
+function parseConfigBatchBoolean(value: unknown): boolean {
+  return (
+    value === true ||
+    value === 1 ||
+    value === "1" ||
+    String(value ?? "").trim().toLowerCase() === "true" ||
+    String(value ?? "").trim().toLowerCase() === "on"
+  );
+}
+
+function normalizeConfigBatchEntry(value: unknown, index: number): ConfigBatchEntry | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    logWarn("skip config batch sync item: entry is not an object", {
+      index,
+      valueType: typeof value,
+    });
+    return null;
+  }
+  const obj = value as Record<string, unknown>;
+  const path = String(obj.path ?? "").trim();
+  if (!path) {
+    logWarn("skip config batch sync item: path is empty", { index });
+    return null;
+  }
+  if (!Object.prototype.hasOwnProperty.call(obj, "value")) {
+    logWarn("skip config batch sync item: value is missing", { index, path });
+    return null;
+  }
+  const entry: ConfigBatchEntry = {
+    path,
+    value: obj.value,
+  };
+  return entry;
+}
+
+export function extractConfigBatchSync(
   eventAny: Record<string, unknown>,
   meta: Record<string, unknown>,
-): string | null {
+): ConfigBatchSyncPayload | null {
   const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
   const extObjCandidates = [
     parseExtValue(eventAny.ext),
@@ -204,13 +244,30 @@ export function extractConfigPatchRaw(
       continue;
     }
     const openclawObj = openclaw as Record<string, unknown>;
-    if (openclawObj.type !== "config_patch") {
+    const signalType = String(openclawObj.type ?? "").trim();
+    if (signalType !== "config_patch") {
       continue;
     }
-    const raw = openclawObj.raw ?? openclawObj.patch ?? openclawObj.config_patch;
-    if (typeof raw === "string" && raw.trim()) {
-      return raw;
+    const rawBatchEntries = openclawObj.batchEntries ?? openclawObj.batch_entries;
+    if (!Array.isArray(rawBatchEntries)) {
+      continue;
     }
+    const batchEntries = rawBatchEntries
+      .map((item, index) => normalizeConfigBatchEntry(item, index))
+      .filter(Boolean) as ConfigBatchEntry[];
+    if (batchEntries.length === 0) {
+      logWarn("skip config batch sync payload: no valid batch entries", {
+        signalType,
+        rawCount: rawBatchEntries.length,
+      });
+      return null;
+    }
+    return {
+      batchEntries,
+      restartGateway: parseConfigBatchBoolean(
+        openclawObj.restartGateway ?? openclawObj.restart_gateway ?? openclawObj.restart,
+      ),
+    };
   }
   return null;
 }
@@ -567,41 +624,6 @@ export function isHistoryEvent(
     isHistoryRaw === 1 ||
     isHistoryRaw === "1"
   );
-}
-
-export function collectHashCandidates(
-  value: unknown,
-  path = "$",
-  out: Array<{ path: string; value: string }> = [],
-): Array<{ path: string; value: string }> {
-  if (out.length >= 20 || value == null) {
-    return out;
-  }
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length && out.length < 20; i += 1) {
-      collectHashCandidates(value[i], `${path}[${i}]`, out);
-    }
-    return out;
-  }
-  if (typeof value !== "object") {
-    return out;
-  }
-
-  const obj = value as Record<string, unknown>;
-  for (const [key, nested] of Object.entries(obj)) {
-    if (out.length >= 20) {
-      break;
-    }
-    const keyLower = key.toLowerCase();
-    if (keyLower.includes("hash") && typeof nested === "string" && nested.trim()) {
-      out.push({
-        path: `${path}.${key}`,
-        value: nested.trim().slice(0, 24),
-      });
-    }
-    collectHashCandidates(nested, `${path}.${key}`, out);
-  }
-  return out;
 }
 
 export function extractText(event: ClawchatInboundEvent): string {

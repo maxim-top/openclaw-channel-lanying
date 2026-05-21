@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  extractConfigBatchSync,
   extractSessionMapSettingsSync,
   extractSessionMappingSignal,
   extractSessionTranscriptObservedSignal,
@@ -214,6 +215,75 @@ test("session_map_settings_sync parses parent and child toggles", () => {
     {
       sessionMapSync: false,
       mergeSubSessions: false,
+    },
+  );
+});
+
+test("config batch sync parser accepts batchEntries and batch_entries on config_patch envelopes", () => {
+  assert.deepEqual(
+    extractConfigBatchSync(
+      {
+        type: "command",
+        ext: JSON.stringify({
+          openclaw: {
+            type: "config_patch",
+            restart: true,
+            batchEntries: [
+              {
+                path: "models.providers.lanying.baseUrl",
+                value: "https://connector.lanyingim.com/v1",
+              },
+              {
+                path: "agents.defaults.model.fallbacks",
+                value: ["lanying/volcengine/DeepSeek-R1"],
+              },
+            ],
+          },
+        }),
+      },
+      {},
+    ),
+    {
+      restartGateway: true,
+      batchEntries: [
+        {
+          path: "models.providers.lanying.baseUrl",
+          value: "https://connector.lanyingim.com/v1",
+        },
+        {
+          path: "agents.defaults.model.fallbacks",
+          value: ["lanying/volcengine/DeepSeek-R1"],
+        },
+      ],
+    },
+  );
+
+  assert.deepEqual(
+    extractConfigBatchSync(
+      {
+        type: "command",
+        ext: JSON.stringify({
+          openclaw: {
+            type: "config_patch",
+            batch_entries: [
+              {
+                path: "models.providers.lanying.models",
+                value: [{ id: "openai/gpt-5-mini" }],
+              },
+            ],
+          },
+        }),
+      },
+      {},
+    ),
+    {
+      restartGateway: false,
+      batchEntries: [
+        {
+          path: "models.providers.lanying.models",
+          value: [{ id: "openai/gpt-5-mini" }],
+        },
+      ],
     },
   );
 });

@@ -57,6 +57,7 @@ function createMessageFlowHarness(options?: {
   const routerReplies: Array<Record<string, unknown>> = [];
   const texts: Array<{ target: unknown; text: string; ext?: Record<string, unknown> }> = [];
   const seededSyncs: Array<Record<string, unknown>> = [];
+  const handledConfigBatchSync: Array<Record<string, unknown>> = [];
   const handledSessionMapSettingsSync: Array<Record<string, unknown>> = [];
   const reportedSessionMapSettings: Array<Record<string, unknown>> = [];
   const flow = createClawchatSessionMessageFlow({
@@ -84,12 +85,13 @@ function createMessageFlowHarness(options?: {
     sendRouterReplyToSelf: async (message) => {
       routerReplies.push(message);
     },
-    sendConfigPatchMarkerToSelf: async () => undefined,
     sendPresetPromptSyncMarkerToSelf: async () => undefined,
     sendSessionMapSettingsReportToSelf: async (params) => {
       reportedSessionMapSettings.push(params as Record<string, unknown>);
     },
-    applyOpenClawConfigPatch: async () => undefined,
+    applyOpenClawConfigBatchSync: async (payload) => {
+      handledConfigBatchSync.push(payload as Record<string, unknown>);
+    },
     handlePresetPromptSync: async () => undefined,
     handleSessionMapSettingsSync: async (params) => {
       handledSessionMapSettingsSync.push(params as Record<string, unknown>);
@@ -125,6 +127,7 @@ function createMessageFlowHarness(options?: {
     routerReplies,
     texts,
     seededSyncs,
+    handledConfigBatchSync,
     handledSessionMapSettingsSync,
     reportedSessionMapSettings,
   };
@@ -428,6 +431,54 @@ test("self loopback session_map_settings_sync command is consumed but not report
 
   assert.equal(harness.handledSessionMapSettingsSync.length, 1);
   assert.equal(harness.reportedSessionMapSettings.length, 0);
+  assert.equal(harness.dispatched.length, 0);
+});
+
+test("self loopback config batch sync command is consumed before legacy config patch", async () => {
+  const harness = createMessageFlowHarness();
+
+  await harness.flow.onInbound(
+    {
+      id: "config-kv-sync-1",
+      from: "openclaw-user",
+      to: "openclaw-user",
+      type: "command",
+      toType: "roster",
+      content: "",
+      ext: JSON.stringify({
+        openclaw: {
+          type: "config_patch",
+          batchEntries: [
+            {
+              path: "agents.defaults.model.primary",
+              value: "lanying/openai/gpt-5-mini",
+            },
+            {
+              path: "agents.defaults.model.fallbacks",
+              value: ["lanying/volcengine/Doubao-1.5-pro-32k"],
+            },
+          ],
+          restart: true,
+        },
+      }),
+      timestamp: 1008,
+    },
+    "direct",
+    createBaseAccount(),
+  );
+
+  assert.equal(harness.handledConfigBatchSync.length, 1);
+  assert.deepEqual(harness.handledConfigBatchSync[0]?.batchEntries, [
+    {
+      path: "agents.defaults.model.primary",
+      value: "lanying/openai/gpt-5-mini",
+    },
+    {
+      path: "agents.defaults.model.fallbacks",
+      value: ["lanying/volcengine/Doubao-1.5-pro-32k"],
+    },
+  ]);
+  assert.equal(harness.handledConfigBatchSync[0]?.restartGateway, true);
   assert.equal(harness.dispatched.length, 0);
 });
 
