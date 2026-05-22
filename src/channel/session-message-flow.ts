@@ -1,6 +1,7 @@
 import { logDebug, logError, logWarn } from "../shared/logging.js";
 import {
   extractConfigBatchSync,
+  extractProbeRequest,
   extractPresetPromptSync,
   extractSessionMapSettingsSync,
   extractRouterSignal,
@@ -35,6 +36,7 @@ import {
   type ClawchatInboundEvent,
   type ClawchatMessageTarget,
   type OpenClawConfig,
+  type ProbeRequestPayload,
   type ResolvedClawchatAccount,
 } from "../types.js";
 import { pickId } from "../shared/utils.js";
@@ -145,6 +147,10 @@ type MessageFlowContext = {
   handleSessionMapSettingsSync: (params: {
     cfg: OpenClawConfig;
     settings: SessionMapSettingsPayload;
+  }) => Promise<void>;
+  handleProbeRequest: (params: {
+    cfg: OpenClawConfig;
+    probe: ProbeRequestPayload;
   }) => Promise<void>;
   isSessionMapSyncEnabled: (cfg: OpenClawConfig) => boolean;
   sendText: (
@@ -1165,6 +1171,7 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
       ctx.updateSelfIdFromClient("inbound event");
       const selfId = ctx.getSelfId();
       const configBatchSync = extractConfigBatchSync(eventAny, meta);
+      const probeRequest = extractProbeRequest(eventAny, meta);
       const presetPromptSync = extractPresetPromptSync(eventAny, meta);
       const sessionMapSettingsSync = extractSessionMapSettingsSync(eventAny, meta);
       const routerSignal = extractRouterSignal(eventAny, meta);
@@ -1237,6 +1244,40 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
               batchCount: configBatchSync.batchEntries.length,
               paths: configBatchSync.batchEntries.map((entry) => entry.path),
               restartGateway: configBatchSync.restartGateway,
+            });
+          }
+          return;
+        }
+        if (isSelfLoopback && probeRequest) {
+          if (!isCommandOuterMessage(eventAny, meta)) {
+            logDebug("skip loopback probe: outer type is not command", {
+              senderId,
+              toId: toIdRaw,
+              selfId,
+              probeId: probeRequest.probeId,
+            });
+            return;
+          }
+          try {
+            const cfg = await ctx.loadConfig();
+            await ctx.handleProbeRequest({
+              cfg,
+              probe: probeRequest,
+            });
+            logDebug("processed probe request from self loopback message", {
+              senderId,
+              toId: toIdRaw,
+              selfId,
+              probeId: probeRequest.probeId,
+              checks: Object.keys(probeRequest.checks),
+            });
+          } catch (err) {
+            logError("failed to process probe request from self loopback message", {
+              err,
+              senderId,
+              toId: toIdRaw,
+              selfId,
+              probeId: probeRequest.probeId,
             });
           }
           return;

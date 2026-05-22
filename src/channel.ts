@@ -32,6 +32,14 @@ import {
   createConfigBatchSyncDigest,
   runCommandArgv,
 } from "./openclaw/config-kv.js";
+import {
+  buildManagedAgentsContentForProbe,
+  buildProbeValueDigest,
+  evaluatePresetPromptHookConfig,
+  getConfigValueAtPath,
+  PROBE_MANAGED_AGENTS_RELATIVE_PATH,
+  sha256Hex,
+} from "./openclaw/probe.js";
 import { getClawchatRuntime } from "./runtime.js";
 import { asPlainObject, pickId } from "./shared/utils.js";
 import { logDebug, logError, logWarn } from "./shared/logging.js";
@@ -42,6 +50,8 @@ import {
   type ClawchatMessageTarget,
   type ConfigBatchEntry,
   type OpenClawConfig,
+  type ProbeCheckStatus,
+  type ProbeRequestPayload,
   type ResolvedClawchatAccount,
 } from "./types.js";
 
@@ -97,6 +107,19 @@ type ClawchatImClient = {
   };
 };
 
+type ProbeCheckResult = {
+  checked: boolean;
+  status: ProbeCheckStatus;
+  error_code?: string;
+  error_message?: string;
+  details?: Record<string, unknown>;
+};
+
+type PendingProbeRequest = {
+  cfg: OpenClawConfig;
+  probe: ProbeRequestPayload;
+};
+
 // Plugin surface metadata and runtime constants.
 const meta = {
   id: CLAWCHAT_CHANNEL_ID,
@@ -132,7 +155,7 @@ export function resolveClawchatPluginVersion(moduleUrl = import.meta.url): strin
   return "";
 }
 const CLAWCHAT_PLUGIN_VERSION = resolveClawchatPluginVersion();
-const CLAWCHAT_API_VERSION = 3;
+const CLAWCHAT_API_VERSION = 4;
 export function resolveClawchatSdkModulePath(moduleUrl = import.meta.url): string {
   const moduleDir = path.dirname(fileURLToPath(moduleUrl));
   const candidatePaths = [
@@ -168,6 +191,7 @@ const RECONNECT_BASE_DELAY_MS = 2_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const CONFIG_PATCH_DEDUPE_TTL_MS = 60_000;
 const CONFIG_RESTART_DEBOUNCE_MS = 2_000;
+const PROBE_REPORT_DEBOUNCE_MS = 300;
 const SUBAGENT_PARENT_REPLY_SUPPRESSION_TTL_MS = 60_000;
 const CLAWCHAT_MANAGED_DIR = "clawchat";
 const CLAWCHAT_MANAGED_AGENTS_PATH = `${CLAWCHAT_MANAGED_DIR}/AGENTS.md`;
@@ -477,7 +501,7 @@ export function resolvePluginVisibleDeliveryFactFromExt(params: {
 }
 
 // Main plugin session orchestrator.
-class ClawchatSession {
+export class ClawchatSession {
   private client: ClawchatImClient | null = null;
   private accountKey: string | null = null;
   private ensureReadyInFlight: Promise<void> | null = null;
@@ -499,9 +523,22 @@ class ClawchatSession {
     | ((next: Record<string, unknown> & { accountId?: string }) => void)
     | null = null;
   private runtimeAccountId: string | null = null;
+  private lastRuntimeStatus: Record<string, unknown> = {
+    running: false,
+    connected: false,
+    reconnectAttempts: 0,
+    lastError: null,
+  };
   private configPatchQueue: Promise<void> = Promise.resolve();
   private recentConfigBatchSyncByDigest = new Map<string, number>();
   private pendingConfigRestartTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingProbeRequest:
+    | PendingProbeRequest
+    | null = null;
+  private pendingProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingProbeFlushPromise: Promise<void> | null = null;
+  private pendingProbeFlushResolve: (() => void) | null = null;
+  private pendingProbeFlushReject: ((reason?: unknown) => void) | null = null;
   private pendingGroupContext = new Map<
     string,
     Array<{ senderId: string; senderName?: string; body: string; timestamp: number }>
@@ -570,6 +607,7 @@ class ClawchatSession {
     applyOpenClawConfigBatchSync: (payload) => this.applyOpenClawConfigBatchSync(payload),
     handlePresetPromptSync: (params) => this.handlePresetPromptSync(params),
     handleSessionMapSettingsSync: (params) => this.handleSessionMapSettingsSync(params),
+    handleProbeRequest: (params) => this.handleProbeRequest(params),
     isSessionMapSyncEnabled: (cfg) => this.isSessionMapSyncEffectivelyEnabled(cfg),
     sendText: (target, text, account, ext) => this.sendText(target, text, account, ext),
     sendSessionTranscriptObservedToSelf: (update) => this.sendSessionTranscriptObservedToSelf(update),
@@ -1408,6 +1446,10 @@ class ClawchatSession {
   }
 
   private updateRuntimeStatus(next: Record<string, unknown>): void {
+    this.lastRuntimeStatus = {
+      ...this.lastRuntimeStatus,
+      ...next,
+    };
     if (!this.runtimeStatusUpdater) {
       return;
     }
@@ -1570,24 +1612,7 @@ class ClawchatSession {
     chatbotName: string;
     prompt: string;
   }): string {
-    const title = params.chatbotName || params.chatbotId || "unknown-chatbot";
-    const body =
-      params.prompt.trim().length > 0
-        ? params.prompt
-        : "No synced system preset prompt. Previous synced content has been cleared.";
-    return [
-      "# AGENTS.md",
-      "",
-      "This file is managed by the ClawChat plugin for OpenClaw prompt injection.",
-      "",
-      `Chatbot ID: ${params.chatbotId || "unknown"}`,
-      `Chatbot Name: ${title}`,
-      "",
-      "## Synced System Preset Prompt",
-      "",
-      body,
-      "",
-    ].join("\n");
+    return buildManagedAgentsContentForProbe(params);
   }
 
   private ensureManagedAgentsFile(params: {
@@ -1692,6 +1717,319 @@ class ClawchatSession {
       return;
     }
     await this.resyncAllSessionMappingsFromLocalStore();
+  }
+
+  private isProviderInited(cfg: OpenClawConfig): boolean {
+    const models =
+      cfg.models && typeof cfg.models === "object" && !Array.isArray(cfg.models)
+        ? (cfg.models as Record<string, unknown>)
+        : {};
+    const providers =
+      models.providers && typeof models.providers === "object" && !Array.isArray(models.providers)
+        ? (models.providers as Record<string, unknown>)
+        : {};
+    return Boolean(
+      (providers.clawchat && typeof providers.clawchat === "object" && !Array.isArray(providers.clawchat)) ||
+        (providers.lanying && typeof providers.lanying === "object" && !Array.isArray(providers.lanying)),
+    );
+  }
+
+  private buildProbeResult(
+    status: ProbeCheckStatus,
+    details?: Record<string, unknown>,
+    error?: { code: string; message: string },
+  ): ProbeCheckResult {
+    return {
+      checked: true,
+      status,
+      ...(error ? { error_code: error.code, error_message: error.message } : {}),
+      ...(details ? { details } : {}),
+    };
+  }
+
+  private buildProbeFailure(code: string, message: string, details?: Record<string, unknown>): ProbeCheckResult {
+    return this.buildProbeResult("failed", details, { code, message });
+  }
+
+  private async runProbeCheck(
+    checkName: string,
+    fn: () => Promise<ProbeCheckResult> | ProbeCheckResult,
+  ): Promise<ProbeCheckResult> {
+    try {
+      return await fn();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logWarn("probe check failed", {
+        checkName,
+        err,
+      });
+      return this.buildProbeFailure("probe_check_failed", message);
+    }
+  }
+
+  private async handleProbeRequest(params: {
+    cfg: OpenClawConfig;
+    probe: ProbeRequestPayload;
+  }): Promise<void> {
+    this.pendingProbeRequest = params;
+    if (this.pendingProbeFlushPromise && !this.pendingProbeTimer) {
+      // A flush is already in progress. Keep only the latest pending probe and let
+      // the running loop pick it up without scheduling another timer.
+      return this.pendingProbeFlushPromise;
+    }
+    if (this.pendingProbeTimer) {
+      clearTimeout(this.pendingProbeTimer);
+      this.pendingProbeTimer = null;
+    }
+    if (!this.pendingProbeFlushPromise) {
+      this.pendingProbeFlushPromise = new Promise<void>((resolve, reject) => {
+        this.pendingProbeFlushResolve = resolve;
+        this.pendingProbeFlushReject = reject;
+      }).finally(() => {
+        this.pendingProbeFlushPromise = null;
+        this.pendingProbeFlushResolve = null;
+        this.pendingProbeFlushReject = null;
+      });
+    }
+    this.pendingProbeTimer = setTimeout(() => {
+      this.pendingProbeTimer = null;
+      void this.flushPendingProbeRequests()
+        .then(() => {
+          this.pendingProbeFlushResolve?.();
+        })
+        .catch((err) => {
+          this.pendingProbeFlushReject?.(err);
+        });
+    }, PROBE_REPORT_DEBOUNCE_MS);
+    return this.pendingProbeFlushPromise;
+  }
+
+  private async flushPendingProbeRequests(): Promise<void> {
+    while (this.pendingProbeRequest) {
+      const nextProbe = this.pendingProbeRequest;
+      this.pendingProbeRequest = null;
+      const report = await this.collectProbeReport(nextProbe);
+      const latestPendingProbe = ((this as unknown) as {
+        pendingProbeRequest: PendingProbeRequest | null;
+      }).pendingProbeRequest;
+      if (latestPendingProbe) {
+        logDebug("skip stale probe report because a newer probe arrived", {
+          staleProbeId: nextProbe.probe.probeId,
+          nextProbeId: latestPendingProbe.probe.probeId,
+        });
+        continue;
+      }
+      await this.sendProbeReportToSelf(report);
+    }
+  }
+
+  private async collectProbeReport(params: {
+    cfg: OpenClawConfig;
+    probe: ProbeRequestPayload;
+  }): Promise<{
+    probeId: string;
+    results: Record<string, ProbeCheckResult>;
+  }> {
+    const cfg = params.cfg;
+    const probe = params.probe;
+    const account = resolveClawchatAccount(cfg);
+    const results: Record<string, ProbeCheckResult> = {};
+
+    if (probe.checks.health) {
+      results.health = await this.runProbeCheck("health", async () => {
+        const providerInited = this.isProviderInited(cfg);
+        const connected = Boolean(this.lastRuntimeStatus.connected);
+        const reconnectAttempts = Number(this.lastRuntimeStatus.reconnectAttempts ?? 0) || 0;
+        const lastErrorRaw = this.lastRuntimeStatus.lastError;
+        const lastErrorKind =
+          typeof lastErrorRaw === "string" && lastErrorRaw.trim() ? lastErrorRaw.trim() : null;
+        const details = {
+          running: true,
+          connected,
+          provider_inited: providerInited,
+          reconnect_attempts: reconnectAttempts,
+          last_error_kind: lastErrorKind,
+          last_connected_at:
+            typeof this.lastRuntimeStatus.lastConnectedAt === "number"
+              ? this.lastRuntimeStatus.lastConnectedAt
+              : null,
+          self_id_ready: Boolean(this.selfId.trim()),
+        };
+        const status: ProbeCheckStatus =
+          connected && providerInited && reconnectAttempts === 0 && !lastErrorKind ? "ok" : "degraded";
+        return this.buildProbeResult(status, details);
+      });
+    }
+
+    if (probe.checks.accountConfig) {
+      results.account_config = await this.runProbeCheck("account_config", async () => {
+        const defaultToPresent = typeof account.defaultTo === "string" && account.defaultTo.trim().length > 0;
+        const details = {
+          enabled: account.enabled,
+          configured: account.configured,
+          allow_manage: account.allowManage,
+          dm_policy: account.dmPolicy,
+          group_policy: account.groupPolicy,
+          default_to_present: defaultToPresent,
+        };
+        let status: ProbeCheckStatus = "ok";
+        if (!account.enabled || !account.configured) {
+          status = "mismatch";
+        } else if (!account.allowManage) {
+          status = "degraded";
+        }
+        return this.buildProbeResult(status, details);
+      });
+    }
+
+    if (probe.checks.configPatch) {
+      results.config_patch = await this.runProbeCheck("config_patch", async () => {
+        const matchedKeys: string[] = [];
+        const mismatchedKeys: string[] = [];
+        const failedKeys: string[] = [];
+        for (const item of probe.checks.configPatch?.items ?? []) {
+          try {
+            const resolved = getConfigValueAtPath(cfg as Record<string, unknown>, item.path);
+            const actualHash = buildProbeValueDigest(resolved.value, resolved.found, item.path);
+            if (actualHash === item.expectedHash) {
+              matchedKeys.push(item.path);
+            } else {
+              mismatchedKeys.push(item.path);
+            }
+          } catch (error) {
+            if (item.path === "models.providers.lanying.models") {
+              logWarn("probe config patch evaluation failed", {
+                path: item.path,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            failedKeys.push(item.path);
+          }
+        }
+        const details = {
+          all_match: mismatchedKeys.length === 0 && failedKeys.length === 0,
+          matched_keys: matchedKeys,
+          mismatched_keys: mismatchedKeys,
+          failed_keys: failedKeys,
+        };
+        const status: ProbeCheckStatus =
+          failedKeys.length > 0 ? "failed" : mismatchedKeys.length > 0 ? "mismatch" : "ok";
+        return this.buildProbeResult(
+          status,
+          details,
+          failedKeys.length > 0
+            ? {
+                code: "config_patch_probe_failed",
+                message: "Failed to evaluate one or more config patch probe items.",
+              }
+            : undefined,
+        );
+      });
+    }
+
+    if (probe.checks.presetPromptContent) {
+      results.preset_prompt_content = await this.runProbeCheck("preset_prompt_content", async () => {
+        const location = this.resolveManagedAgentsLocation(cfg);
+        if (!fs.existsSync(location.managedFile)) {
+          return this.buildProbeFailure("managed_agents_file_missing", "Managed AGENTS.md file is missing.");
+        }
+        const content = fs.readFileSync(location.managedFile, "utf8");
+        const actualHash = sha256Hex(content);
+        const match = actualHash === probe.checks.presetPromptContent?.expectedHash;
+        return this.buildProbeResult(match ? "ok" : "mismatch", {
+          match,
+        });
+      });
+    }
+
+    if (probe.checks.presetPromptHook) {
+      results.preset_prompt_hook = await this.runProbeCheck("preset_prompt_hook", async () => {
+        const hookResult = evaluatePresetPromptHookConfig(
+          cfg,
+          probe.checks.presetPromptHook?.requiredPath || PROBE_MANAGED_AGENTS_RELATIVE_PATH,
+        );
+        return this.buildProbeResult(hookResult.match ? "ok" : "mismatch", {
+          match: hookResult.match,
+          missing_requirements: hookResult.missingRequirements,
+        });
+      });
+    }
+
+    if (probe.checks.workspaceFiles) {
+      results.workspace_files = await this.runProbeCheck("workspace_files", async () => {
+        const location = this.resolveManagedAgentsLocation(cfg);
+        const workspaceDir = path.dirname(location.managedDir);
+        const details = {
+          workspace_dir_exists: fs.existsSync(workspaceDir),
+          managed_dir_exists: fs.existsSync(location.managedDir),
+          managed_agents_file_exists: fs.existsSync(location.managedFile),
+          managed_agents_file_readable: false,
+          managed_agents_file_writable: false,
+        };
+        if (details.managed_agents_file_exists) {
+          try {
+            fs.accessSync(location.managedFile, fs.constants.R_OK);
+            details.managed_agents_file_readable = true;
+          } catch {
+            details.managed_agents_file_readable = false;
+          }
+          try {
+            fs.accessSync(location.managedFile, fs.constants.W_OK);
+            details.managed_agents_file_writable = true;
+          } catch {
+            details.managed_agents_file_writable = false;
+          }
+        }
+        const status: ProbeCheckStatus =
+          details.workspace_dir_exists &&
+          details.managed_dir_exists &&
+          details.managed_agents_file_exists &&
+          details.managed_agents_file_readable &&
+          details.managed_agents_file_writable
+            ? "ok"
+            : "degraded";
+        return this.buildProbeResult(status, details);
+      });
+    }
+
+    if (probe.checks.sessionMapRuntime) {
+      results.session_map_runtime = await this.runProbeCheck("session_map_runtime", async () => {
+        const effectiveEnabled = account.allowManage && this.sessionMapSyncEnabled;
+        const details = {
+          session_map_sync_enabled: this.sessionMapSyncEnabled,
+          merge_sub_sessions_enabled: this.mergeSubSessionsEnabled,
+          allow_manage: account.allowManage,
+          effective_enabled: effectiveEnabled,
+        };
+        const expected = probe.checks.sessionMapRuntime ?? {};
+        const match =
+          (typeof expected.expectedSessionMapSyncEnabled !== "boolean" ||
+            expected.expectedSessionMapSyncEnabled === this.sessionMapSyncEnabled) &&
+          (typeof expected.expectedMergeSubSessionsEnabled !== "boolean" ||
+            expected.expectedMergeSubSessionsEnabled === this.mergeSubSessionsEnabled) &&
+          (typeof expected.expectedEffectiveEnabled !== "boolean" ||
+            expected.expectedEffectiveEnabled === effectiveEnabled);
+        return this.buildProbeResult(match ? "ok" : "mismatch", details);
+      });
+    }
+
+    if (probe.checks.onlineMarker) {
+      results.online_marker = await this.runProbeCheck("online_marker", async () => {
+        const details = {
+          online_marker_sent: this.onlineMarkerSent,
+          offline_marker_sent: this.offlineMarkerSent,
+          self_id_ready: Boolean(this.selfId.trim()),
+        };
+        const status: ProbeCheckStatus =
+          details.self_id_ready && details.online_marker_sent ? "ok" : "degraded";
+        return this.buildProbeResult(status, details);
+      });
+    }
+
+    return {
+      probeId: probe.probeId,
+      results,
+    };
   }
 
   private currentConfigKey(account: ResolvedClawchatAccount): string {
@@ -2478,19 +2816,8 @@ class ClawchatSession {
         return;
       }
       const runtime = getClawchatRuntime();
-      const cfg = (await runtime.config.loadConfig()) as OpenClawConfig & {
-        models?: {
-          providers?: Record<string, unknown>;
-        };
-      };
-      const providerInited = Boolean(
-        (cfg.models?.providers?.clawchat &&
-          typeof cfg.models.providers.clawchat === "object" &&
-          !Array.isArray(cfg.models.providers.clawchat)) ||
-          (cfg.models?.providers?.lanying &&
-            typeof cfg.models.providers.lanying === "object" &&
-            !Array.isArray(cfg.models.providers.lanying)),
-      );
+      const cfg = (await runtime.config.loadConfig()) as OpenClawConfig;
+      const providerInited = this.isProviderInited(cfg);
       await client.sysManage.sendRosterMessage({
         type: "text",
         uid: selfId,
@@ -2530,6 +2857,43 @@ class ClawchatSession {
       logDebug("sent offline marker message to self", { selfId: this.selfId });
     } catch (err) {
       logWarn("failed to send offline marker message to self", { err, selfId: this.selfId });
+    }
+  }
+
+  private async sendProbeReportToSelf(params: {
+    probeId: string;
+    results: Record<string, ProbeCheckResult>;
+  }): Promise<void> {
+    if (!this.client || !this.selfId) {
+      return;
+    }
+    try {
+      await this.client.sysManage.sendRosterMessage({
+        type: "command",
+        uid: this.selfId,
+        content: "",
+        ext: JSON.stringify({
+          openclaw: {
+            type: "probe_report",
+            probe_id: params.probeId,
+            plugin_version: CLAWCHAT_PLUGIN_VERSION,
+            api_version: CLAWCHAT_API_VERSION,
+            reported_at: Date.now(),
+            results: params.results,
+          },
+        }),
+      });
+      logDebug("sent probe_report message to self", {
+        selfId: this.selfId,
+        probeId: params.probeId,
+        checks: Object.keys(params.results),
+      });
+    } catch (err) {
+      logWarn("failed to send probe_report message to self", {
+        err,
+        selfId: this.selfId,
+        probeId: params.probeId,
+      });
     }
   }
 
@@ -2681,6 +3045,12 @@ class ClawchatSession {
         clearTimeout(this.pendingConfigRestartTimer);
         this.pendingConfigRestartTimer = null;
       }
+      if (this.pendingProbeTimer) {
+        clearTimeout(this.pendingProbeTimer);
+        this.pendingProbeTimer = null;
+      }
+      this.pendingProbeRequest = null;
+      this.pendingProbeFlushResolve?.();
       this.reconnectPromise = null;
       this.reconnectAttempts = 0;
       this.reconnectForceRecreate = false;

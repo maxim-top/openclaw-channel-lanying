@@ -63,6 +63,39 @@ export type ConfigBatchEntry = {
   value: unknown;
 };
 
+export type ProbeCheckStatus = "ok" | "mismatch" | "degraded" | "failed";
+
+export type ConfigPatchProbeItem = {
+  path: string;
+  expectedHash: string;
+  expectedSummary?: unknown;
+};
+
+export type ProbeRequestPayload = {
+  probeId: string;
+  formatVersion: number;
+  checks: {
+    health?: Record<string, unknown>;
+    accountConfig?: Record<string, unknown>;
+    configPatch?: {
+      items: ConfigPatchProbeItem[];
+    };
+    presetPromptContent?: {
+      expectedHash: string;
+    };
+    presetPromptHook?: {
+      requiredPath?: string;
+    };
+    workspaceFiles?: Record<string, unknown>;
+    sessionMapRuntime?: {
+      expectedSessionMapSyncEnabled?: boolean;
+      expectedMergeSubSessionsEnabled?: boolean;
+      expectedEffectiveEnabled?: boolean;
+    };
+    onlineMarker?: Record<string, unknown>;
+  };
+};
+
 export type ClawchatInboundEvent = {
   from?: { uid?: string | number; id?: string | number } | string | number;
   to?: { uid?: string | number; id?: string | number } | string | number;

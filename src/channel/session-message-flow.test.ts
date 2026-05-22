@@ -59,6 +59,7 @@ function createMessageFlowHarness(options?: {
   const seededSyncs: Array<Record<string, unknown>> = [];
   const handledConfigBatchSync: Array<Record<string, unknown>> = [];
   const handledSessionMapSettingsSync: Array<Record<string, unknown>> = [];
+  const handledProbeRequests: Array<Record<string, unknown>> = [];
   const reportedSessionMapSettings: Array<Record<string, unknown>> = [];
   const flow = createClawchatSessionMessageFlow({
     getSelfId: () => "openclaw-user",
@@ -96,6 +97,9 @@ function createMessageFlowHarness(options?: {
     handleSessionMapSettingsSync: async (params) => {
       handledSessionMapSettingsSync.push(params as Record<string, unknown>);
     },
+    handleProbeRequest: async (params) => {
+      handledProbeRequests.push(params as Record<string, unknown>);
+    },
     isSessionMapSyncEnabled: () =>
       options?.sessionMapSyncEnabled !== false && options?.allowManage !== false,
     sendText: async (target, text, _account, ext) => {
@@ -129,6 +133,7 @@ function createMessageFlowHarness(options?: {
     seededSyncs,
     handledConfigBatchSync,
     handledSessionMapSettingsSync,
+    handledProbeRequests,
     reportedSessionMapSettings,
   };
 }
@@ -198,6 +203,19 @@ function createImReplyDeliveryExt() {
   });
 }
 
+function createProbeExt() {
+  return JSON.stringify({
+    openclaw: {
+      type: "probe",
+      probe_id: "probe-1",
+      formatVersion: 1,
+      checks: {
+        health: {},
+      },
+    },
+  });
+}
+
 test("self loopback session_transcript_observed command is consumed as a control envelope", async () => {
   const harness = createMessageFlowHarness();
 
@@ -220,6 +238,35 @@ test("self loopback session_transcript_observed command is consumed as a control
   assert.equal(harness.dispatched.length, 0);
   assert.equal(harness.texts.length, 0);
   assert.equal(harness.routerReplies.length, 0);
+});
+
+test("self loopback probe command is consumed and dispatched to the probe handler", async () => {
+  const harness = createMessageFlowHarness();
+
+  await harness.flow.onInbound(
+    {
+      id: "probe-loopback-1",
+      from: "openclaw-user",
+      to: "openclaw-user",
+      type: "command",
+      toType: "roster",
+      content: "",
+      ext: createProbeExt(),
+      timestamp: 1002,
+    },
+    "direct",
+    createBaseAccount(),
+  );
+
+  assert.equal(harness.handledProbeRequests.length, 1);
+  const handledProbe = harness.handledProbeRequests[0] as {
+    probe?: {
+      probeId?: string;
+    };
+  };
+  assert.equal(handledProbe.probe?.probeId, "probe-1");
+  assert.equal(harness.recorded.length, 0);
+  assert.equal(harness.dispatched.length, 0);
 });
 
 test("non-command session_transcript_observed loopback is dropped before normal inbound", async () => {

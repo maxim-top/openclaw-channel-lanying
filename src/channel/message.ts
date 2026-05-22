@@ -1,6 +1,10 @@
 import { logWarn } from "../shared/logging.js";
 import { maybeParseJson, pickId } from "../shared/utils.js";
-import { type ClawchatInboundEvent, type ConfigBatchEntry } from "../types.js";
+import {
+  type ClawchatInboundEvent,
+  type ConfigBatchEntry,
+  type ProbeRequestPayload,
+} from "../types.js";
 
 export type ConfigBatchSyncPayload = {
   batchEntries: ConfigBatchEntry[];
@@ -87,6 +91,23 @@ export type SessionSyncDeliverySignal = {
   role?: string;
   messageId?: string;
 };
+
+function parseProbeBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized === "true" || normalized === "on" || normalized === "1") {
+    return true;
+  }
+  if (normalized === "false" || normalized === "off" || normalized === "0") {
+    return false;
+  }
+  return undefined;
+}
 
 export function normalizeClawchatSessionKey(value: unknown): string {
   const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -313,6 +334,131 @@ export function extractPresetPromptSync(
       chatbotId: String(openclawObj.chatbotId ?? "").trim(),
       chatbotName: String(openclawObj.chatbotName ?? "").trim(),
       prompt: typeof openclawObj.prompt === "string" ? openclawObj.prompt : "",
+    };
+  }
+  return null;
+}
+
+export function extractProbeRequest(
+  eventAny: Record<string, unknown>,
+  meta: Record<string, unknown>,
+): ProbeRequestPayload | null {
+  const payload = (eventAny.payload ?? meta.payload) as Record<string, unknown> | undefined;
+  const extObjCandidates = [
+    parseExtValue(eventAny.ext),
+    parseExtValue(meta.ext),
+    parseExtValue(payload?.ext),
+  ].filter(Boolean) as Record<string, unknown>[];
+
+  for (const extObj of extObjCandidates) {
+    const openclaw = extObj.openclaw;
+    if (!openclaw || typeof openclaw !== "object" || Array.isArray(openclaw)) {
+      continue;
+    }
+    const openclawObj = openclaw as Record<string, unknown>;
+    if (String(openclawObj.type ?? "").trim() !== "probe") {
+      continue;
+    }
+    const checksValue =
+      openclawObj.checks && typeof openclawObj.checks === "object" && !Array.isArray(openclawObj.checks)
+        ? (openclawObj.checks as Record<string, unknown>)
+        : {};
+    const configPatchValue =
+      checksValue.config_patch &&
+      typeof checksValue.config_patch === "object" &&
+      !Array.isArray(checksValue.config_patch)
+        ? (checksValue.config_patch as Record<string, unknown>)
+        : {};
+    const rawItems = Array.isArray(configPatchValue.items) ? configPatchValue.items : [];
+    const items = rawItems
+      .map((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          return null;
+        }
+        const itemObj = item as Record<string, unknown>;
+        const path = String(itemObj.path ?? "").trim();
+        const expectedHash = String(itemObj.expected_hash ?? itemObj.expectedHash ?? "").trim();
+        if (!path || !expectedHash) {
+          return null;
+        }
+        return {
+          path,
+          expectedHash,
+          expectedSummary: itemObj.expected_summary ?? itemObj.expectedSummary,
+        };
+      })
+      .filter(Boolean) as Array<{ path: string; expectedHash: string; expectedSummary?: unknown }>;
+    const presetPromptContentValue =
+      checksValue.preset_prompt_content &&
+      typeof checksValue.preset_prompt_content === "object" &&
+      !Array.isArray(checksValue.preset_prompt_content)
+        ? (checksValue.preset_prompt_content as Record<string, unknown>)
+        : {};
+    const presetPromptHookValue =
+      checksValue.preset_prompt_hook &&
+      typeof checksValue.preset_prompt_hook === "object" &&
+      !Array.isArray(checksValue.preset_prompt_hook)
+        ? (checksValue.preset_prompt_hook as Record<string, unknown>)
+        : {};
+    const sessionMapRuntimeValue =
+      checksValue.session_map_runtime &&
+      typeof checksValue.session_map_runtime === "object" &&
+      !Array.isArray(checksValue.session_map_runtime)
+        ? (checksValue.session_map_runtime as Record<string, unknown>)
+        : {};
+    return {
+      probeId: String(openclawObj.probe_id ?? openclawObj.probeId ?? "").trim(),
+      formatVersion: Number(openclawObj.formatVersion ?? 1) || 1,
+      checks: {
+        ...(checksValue.health && typeof checksValue.health === "object"
+          ? { health: checksValue.health as Record<string, unknown> }
+          : {}),
+        ...(checksValue.account_config && typeof checksValue.account_config === "object"
+          ? { accountConfig: checksValue.account_config as Record<string, unknown> }
+          : {}),
+        ...(checksValue.config_patch && typeof checksValue.config_patch === "object"
+          ? { configPatch: { items } }
+          : {}),
+        ...(typeof presetPromptContentValue.expected_hash === "string" &&
+        presetPromptContentValue.expected_hash.trim()
+          ? {
+              presetPromptContent: {
+                expectedHash: presetPromptContentValue.expected_hash.trim(),
+              },
+            }
+          : {}),
+        ...(checksValue.preset_prompt_hook && typeof checksValue.preset_prompt_hook === "object"
+          ? {
+              presetPromptHook: {
+                requiredPath:
+                  typeof presetPromptHookValue.required_path === "string"
+                    ? presetPromptHookValue.required_path.trim()
+                    : undefined,
+              },
+            }
+          : {}),
+        ...(checksValue.workspace_files && typeof checksValue.workspace_files === "object"
+          ? { workspaceFiles: checksValue.workspace_files as Record<string, unknown> }
+          : {}),
+        ...(checksValue.session_map_runtime && typeof checksValue.session_map_runtime === "object"
+          ? {
+              sessionMapRuntime: {
+                expectedSessionMapSyncEnabled: parseProbeBoolean(
+                  sessionMapRuntimeValue.expected_session_map_sync_enabled,
+                ),
+                expectedMergeSubSessionsEnabled: parseProbeBoolean(
+                  sessionMapRuntimeValue.expected_merge_sub_sessions_enabled,
+                ),
+                expectedEffectiveEnabled: parseProbeBoolean(
+                  sessionMapRuntimeValue.expected_effective_enabled,
+                ),
+              },
+            }
+          : {}),
+        ...(checksValue.online_marker && typeof checksValue.online_marker === "object"
+          ? { onlineMarker: checksValue.online_marker as Record<string, unknown> }
+          : {}),
+      },
     };
   }
   return null;
