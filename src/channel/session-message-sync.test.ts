@@ -245,6 +245,7 @@ test("config batch sync parser accepts batchEntries and batch_entries on config_
     ),
     {
       restartGateway: true,
+      syncId: "",
       batchEntries: [
         {
           path: "models.providers.lanying.baseUrl",
@@ -278,10 +279,44 @@ test("config batch sync parser accepts batchEntries and batch_entries on config_
     ),
     {
       restartGateway: false,
+      syncId: "",
       batchEntries: [
         {
           path: "models.providers.lanying.models",
           value: [{ id: "openai/gpt-5-mini" }],
+        },
+      ],
+    },
+  );
+});
+
+test("config batch sync parser extracts sync_id from config_patch envelopes", () => {
+  assert.deepEqual(
+    extractConfigBatchSync(
+      {
+        type: "command",
+        ext: JSON.stringify({
+          openclaw: {
+            type: "config_patch",
+            sync_id: "sync-1",
+            batchEntries: [
+              {
+                path: "agents.defaults.model.primary",
+                value: "lanying/openai/gpt-5-mini",
+              },
+            ],
+          },
+        }),
+      },
+      {},
+    ),
+    {
+      restartGateway: false,
+      syncId: "sync-1",
+      batchEntries: [
+        {
+          path: "agents.defaults.model.primary",
+          value: "lanying/openai/gpt-5-mini",
         },
       ],
     },

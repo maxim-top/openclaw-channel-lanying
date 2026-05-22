@@ -120,6 +120,119 @@ type PendingProbeRequest = {
   probe: ProbeRequestPayload;
 };
 
+function summarizeOpenclawCommandPayload(rawExt: unknown): Record<string, unknown> | undefined {
+  if (typeof rawExt !== "string" || !rawExt.trim()) {
+    return undefined;
+  }
+  try {
+    const extObj = JSON.parse(rawExt) as Record<string, unknown>;
+    const openclawValue =
+      extObj && typeof extObj === "object" && !Array.isArray(extObj) ? extObj.openclaw : undefined;
+    if (!openclawValue || typeof openclawValue !== "object" || Array.isArray(openclawValue)) {
+      return undefined;
+    }
+    const openclaw = openclawValue as Record<string, unknown>;
+    const type = String(openclaw.type ?? "").trim();
+    if (!type) {
+      return { hasOpenclaw: true };
+    }
+    if (type === "config_patch") {
+      const batchEntries = Array.isArray(openclaw.batchEntries)
+        ? openclaw.batchEntries
+        : Array.isArray(openclaw.batch_entries)
+          ? openclaw.batch_entries
+          : [];
+      const paths = batchEntries
+        .map((item) =>
+          item && typeof item === "object" && !Array.isArray(item)
+            ? String((item as { path?: unknown }).path ?? "").trim()
+            : "",
+        )
+        .filter(Boolean);
+      return {
+        hasOpenclaw: true,
+        type,
+        syncId: String(openclaw.sync_id ?? openclaw.syncId ?? "").trim() || undefined,
+        restart: Boolean(openclaw.restart),
+        batchCount: batchEntries.length,
+        paths,
+      };
+    }
+    if (type === "probe") {
+      const checksValue =
+        openclaw.checks && typeof openclaw.checks === "object" && !Array.isArray(openclaw.checks)
+          ? (openclaw.checks as Record<string, unknown>)
+          : {};
+      const configPatch =
+        checksValue.config_patch &&
+        typeof checksValue.config_patch === "object" &&
+        !Array.isArray(checksValue.config_patch)
+          ? (checksValue.config_patch as Record<string, unknown>)
+          : {};
+      const items = Array.isArray(configPatch.items) ? configPatch.items : [];
+      const paths = items
+        .map((item) =>
+          item && typeof item === "object" && !Array.isArray(item)
+            ? String((item as { path?: unknown }).path ?? "").trim()
+            : "",
+        )
+        .filter(Boolean);
+      return {
+        hasOpenclaw: true,
+        type,
+        probeId: String(openclaw.probe_id ?? openclaw.probeId ?? "").trim() || undefined,
+        checks: Object.keys(checksValue),
+        configPatchItems: items.length,
+        configPatchPaths: paths,
+      };
+    }
+    if (type === "config_sync_report") {
+      return {
+        hasOpenclaw: true,
+        type,
+        syncId: String(openclaw.sync_id ?? openclaw.syncId ?? "").trim() || undefined,
+        objectType: String(openclaw.object_type ?? openclaw.objectType ?? "").trim() || undefined,
+        status: String(openclaw.status ?? "").trim() || undefined,
+        errorCode: String(openclaw.error_code ?? openclaw.errorCode ?? "").trim() || undefined,
+      };
+    }
+    return {
+      hasOpenclaw: true,
+      type,
+    };
+  } catch {
+    return {
+      hasOpenclaw: false,
+      extRedacted: true,
+    };
+  }
+}
+
+function summarizeInboundEventForLog(event: unknown): unknown {
+  const eventObj = asPlainObject(event);
+  if (!eventObj) {
+    return event;
+  }
+  const type = String(eventObj.type ?? "").trim();
+  if (type !== "command") {
+    return event;
+  }
+  return {
+    id: eventObj.id,
+    from: eventObj.from,
+    to: eventObj.to,
+    type,
+    status: eventObj.status,
+    timestamp: eventObj.timestamp,
+    toType: eventObj.toType,
+    isHistory: eventObj.isHistory,
+    isNative: eventObj.isNative,
+    isPlayed: eventObj.isPlayed,
+    editTimestamp: eventObj.editTimestamp,
+    openclaw: summarizeOpenclawCommandPayload(eventObj.ext),
+  };
+}
+
 // Plugin surface metadata and runtime constants.
 const meta = {
   id: CLAWCHAT_CHANNEL_ID,
@@ -530,8 +643,12 @@ export class ClawchatSession {
     lastError: null,
   };
   private configPatchQueue: Promise<void> = Promise.resolve();
+  private gatewayRestartQueue: Promise<void> = Promise.resolve();
   private recentConfigBatchSyncByDigest = new Map<string, number>();
   private pendingConfigRestartTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingConfigRestartPromise: Promise<void> | null = null;
+  private pendingConfigRestartResolve: (() => void) | null = null;
+  private pendingConfigRestartReject: ((reason?: unknown) => void) | null = null;
   private pendingProbeRequest:
     | PendingProbeRequest
     | null = null;
@@ -604,6 +721,7 @@ export class ClawchatSession {
     sendRouterReplyToSelf: (message) => this.sendRouterReplyToSelf(message),
     sendPresetPromptSyncMarkerToSelf: (params) => this.sendPresetPromptSyncMarkerToSelf(params),
     sendSessionMapSettingsReportToSelf: (params) => this.sendSessionMapSettingsReportToSelf(params),
+    sendConfigSyncReportToSelf: (params) => this.sendConfigSyncReportToSelf(params),
     applyOpenClawConfigBatchSync: (payload) => this.applyOpenClawConfigBatchSync(payload),
     handlePresetPromptSync: (params) => this.handlePresetPromptSync(params),
     handleSessionMapSettingsSync: (params) => this.handleSessionMapSettingsSync(params),
@@ -1462,6 +1580,7 @@ export class ClawchatSession {
   private async applyOpenClawConfigBatchSync(params: {
     batchEntries: ConfigBatchEntry[];
     restartGateway: boolean;
+    syncId?: string;
   }): Promise<void> {
     const digest = createConfigBatchSyncDigest(params.batchEntries);
     const work = async (): Promise<void> => {
@@ -1481,7 +1600,13 @@ export class ClawchatSession {
       }
       await applyConfigBatchEntries(params.batchEntries);
       if (params.restartGateway) {
-        this.scheduleDebouncedConfigRestart();
+        void this.scheduleDebouncedConfigRestart().catch((err) => {
+          logWarn("background gateway restart after config sync failed", {
+            err,
+            digest,
+            batchCount: params.batchEntries.length,
+          });
+        });
       }
       this.recentConfigBatchSyncByDigest.set(digest, Date.now());
     };
@@ -1491,13 +1616,19 @@ export class ClawchatSession {
     await queued;
   }
 
-  private scheduleDebouncedConfigRestart(): void {
+  private scheduleDebouncedConfigRestart(): Promise<void> {
     if (this.shuttingDown) {
       logDebug("skip scheduling debounced gateway restart while shutting down");
-      return;
+      return Promise.resolve();
     }
     if (this.pendingConfigRestartTimer) {
       clearTimeout(this.pendingConfigRestartTimer);
+    }
+    if (!this.pendingConfigRestartPromise) {
+      this.pendingConfigRestartPromise = new Promise<void>((resolve, reject) => {
+        this.pendingConfigRestartResolve = resolve;
+        this.pendingConfigRestartReject = reject;
+      });
     }
     logDebug("schedule debounced gateway restart after config update", {
       delayMs: CONFIG_RESTART_DEBOUNCE_MS,
@@ -1506,18 +1637,32 @@ export class ClawchatSession {
       this.pendingConfigRestartTimer = null;
       if (this.shuttingDown) {
         logDebug("skip debounced gateway restart because session is shutting down");
+        this.pendingConfigRestartResolve?.();
+        this.pendingConfigRestartPromise = null;
+        this.pendingConfigRestartResolve = null;
+        this.pendingConfigRestartReject = null;
         return;
       }
       const restartWork = async (): Promise<void> => {
         logDebug("run debounced gateway restart after config updates");
         await runCommandArgv(buildGatewayRestartArgv());
       };
-      const queued = this.configPatchQueue.then(restartWork, restartWork);
-      this.configPatchQueue = queued.catch(() => undefined);
-      void queued.catch((err) => {
+      const queued = this.gatewayRestartQueue.then(restartWork, restartWork);
+      this.gatewayRestartQueue = queued.catch(() => undefined);
+      void queued.then(() => {
+        this.pendingConfigRestartResolve?.();
+        this.pendingConfigRestartPromise = null;
+        this.pendingConfigRestartResolve = null;
+        this.pendingConfigRestartReject = null;
+      }).catch((err) => {
+        this.pendingConfigRestartReject?.(err);
+        this.pendingConfigRestartPromise = null;
+        this.pendingConfigRestartResolve = null;
+        this.pendingConfigRestartReject = null;
         logWarn("debounced gateway restart after config updates failed", { err });
       });
     }, CONFIG_RESTART_DEBOUNCE_MS);
+    return this.pendingConfigRestartPromise;
   }
 
   private resolveUserPath(input: string): string {
@@ -2050,11 +2195,11 @@ export class ClawchatSession {
     this.listenersBound = true;
     logDebug("binding inbound listeners");
     const onDirect = (name: string, event: unknown) => {
-      logDebug(`inbound event: ${name}`, event);
+      logDebug(`inbound event: ${name}`, summarizeInboundEventForLog(event));
       void this.onInbound(event as ClawchatInboundEvent, "direct", account, name);
     };
     const onGroup = (name: string, event: unknown) => {
-      logDebug(`inbound event: ${name}`, event);
+      logDebug(`inbound event: ${name}`, summarizeInboundEventForLog(event));
       void this.onInbound(event as ClawchatInboundEvent, "group", account, name);
     };
 
@@ -2897,6 +3042,50 @@ export class ClawchatSession {
     }
   }
 
+  private async sendConfigSyncReportToSelf(params: {
+    syncId: string;
+    objectType: "config_patch";
+    status: "ok" | "failed";
+    errorCode?: string;
+    errorMessage?: string;
+  }): Promise<void> {
+    if (!this.client || !this.selfId || !params.syncId.trim()) {
+      return;
+    }
+    try {
+      await this.client.sysManage.sendRosterMessage({
+        type: "command",
+        uid: this.selfId,
+        content: "",
+        ext: JSON.stringify({
+          openclaw: {
+            type: "config_sync_report",
+            sync_id: params.syncId,
+            object_type: params.objectType,
+            status: params.status,
+            error_code: params.errorCode ?? "",
+            error_message: params.errorMessage ?? "",
+            plugin_version: CLAWCHAT_PLUGIN_VERSION,
+            api_version: CLAWCHAT_API_VERSION,
+            reported_at: Date.now(),
+          },
+        }),
+      });
+      logDebug("sent config_sync_report message to self", {
+        selfId: this.selfId,
+        syncId: params.syncId,
+        status: params.status,
+      });
+    } catch (err) {
+      logWarn("failed to send config_sync_report message to self", {
+        err,
+        selfId: this.selfId,
+        syncId: params.syncId,
+        status: params.status,
+      });
+    }
+  }
+
   private async sendPresetPromptSyncMarkerToSelf(params: {
     stage: "before" | "after";
     chatbotId: string;
@@ -3045,6 +3234,10 @@ export class ClawchatSession {
         clearTimeout(this.pendingConfigRestartTimer);
         this.pendingConfigRestartTimer = null;
       }
+      this.pendingConfigRestartResolve?.();
+      this.pendingConfigRestartPromise = null;
+      this.pendingConfigRestartResolve = null;
+      this.pendingConfigRestartReject = null;
       if (this.pendingProbeTimer) {
         clearTimeout(this.pendingProbeTimer);
         this.pendingProbeTimer = null;

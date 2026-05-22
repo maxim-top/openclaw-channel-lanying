@@ -10,6 +10,7 @@ import {
   buildGatewayRestartArgv,
   createConfigBatchSyncDigest,
   isRetryableConfigConflictMessage,
+  summarizeCommandArgvForLog,
 } from "./config-kv.js";
 import { setClawchatRuntime } from "../runtime.js";
 
@@ -183,4 +184,26 @@ test("applyConfigBatchEntries does not retry non-conflict failures", async () =>
     /validation failed: expected string/,
   );
   assert.equal(attempts, 1);
+});
+
+test("summarizeCommandArgvForLog redacts batch-json values while preserving paths", () => {
+  const summary = summarizeCommandArgvForLog([
+    "openclaw",
+    "config",
+    "set",
+    "--batch-json",
+    JSON.stringify([
+      { path: "models.providers.lanying.apiKey", value: "super-secret" },
+      { path: "models.providers.lanying.baseUrl", value: "https://example.com/v1" },
+    ]),
+  ]);
+
+  assert.deepEqual(summary, {
+    argvHead: ["openclaw", "config", "set", "--batch-json"],
+    hasBatchJson: true,
+    batchItems: 2,
+    batchPaths: ["models.providers.lanying.apiKey", "models.providers.lanying.baseUrl"],
+  });
+  assert.equal(JSON.stringify(summary).includes("super-secret"), false);
+  assert.equal(JSON.stringify(summary).includes("https://example.com/v1"), false);
 });

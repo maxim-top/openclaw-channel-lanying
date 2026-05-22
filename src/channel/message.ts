@@ -9,6 +9,7 @@ import {
 export type ConfigBatchSyncPayload = {
   batchEntries: ConfigBatchEntry[];
   restartGateway: boolean;
+  syncId: string;
 };
 
 export type PresetPromptSyncPayload = {
@@ -288,6 +289,7 @@ export function extractConfigBatchSync(
       restartGateway: parseConfigBatchBoolean(
         openclawObj.restartGateway ?? openclawObj.restart_gateway ?? openclawObj.restart,
       ),
+      syncId: String(openclawObj.sync_id ?? openclawObj.syncId ?? "").trim(),
     };
   }
   return null;
@@ -384,10 +386,9 @@ export function extractProbeRequest(
         return {
           path,
           expectedHash,
-          expectedSummary: itemObj.expected_summary ?? itemObj.expectedSummary,
         };
       })
-      .filter(Boolean) as Array<{ path: string; expectedHash: string; expectedSummary?: unknown }>;
+      .filter(Boolean) as Array<{ path: string; expectedHash: string }>;
     const presetPromptContentValue =
       checksValue.preset_prompt_content &&
       typeof checksValue.preset_prompt_content === "object" &&

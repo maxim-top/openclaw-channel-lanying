@@ -9,6 +9,37 @@ const CONFIG_COMMAND_TIMEOUT_MS = 30_000;
 const CONFIG_COMMAND_CONFLICT_RETRY_MAX_ATTEMPTS = 3;
 const CONFIG_COMMAND_CONFLICT_RETRY_DELAY_MS = 150;
 
+export function summarizeCommandArgvForLog(argv: string[]): Record<string, unknown> {
+  const batchJsonIndex = argv.indexOf("--batch-json");
+  if (batchJsonIndex < 0 || batchJsonIndex + 1 >= argv.length) {
+    return {
+      argv,
+    };
+  }
+  let batchItems = 0;
+  let batchPaths: string[] = [];
+  try {
+    const payload = JSON.parse(argv[batchJsonIndex + 1]);
+    if (Array.isArray(payload)) {
+      batchItems = payload.length;
+      batchPaths = payload
+        .map((item) =>
+          item && typeof item === "object" && !Array.isArray(item) ? String((item as { path?: unknown }).path ?? "").trim() : "",
+        )
+        .filter(Boolean);
+    }
+  } catch {
+    batchItems = 0;
+    batchPaths = [];
+  }
+  return {
+    argvHead: argv.slice(0, batchJsonIndex + 1),
+    hasBatchJson: true,
+    batchItems,
+    batchPaths,
+  };
+}
+
 export function normalizeConfigBatchEntryForDigest(entry: ConfigBatchEntry): Record<string, unknown> {
   return {
     path: entry.path.trim(),
@@ -82,15 +113,16 @@ function extractCommandFailure(result: unknown): { stdout: string; stderr: strin
 
 export async function runCommandArgv(argv: string[]): Promise<void> {
   const runtime = getClawchatRuntime();
+  const commandLog = summarizeCommandArgvForLog(argv);
   for (let attempt = 1; attempt <= CONFIG_COMMAND_CONFLICT_RETRY_MAX_ATTEMPTS; attempt += 1) {
-    logDebug("exec openclaw config command", { argv, attempt });
+    logDebug("exec openclaw config command", { ...commandLog, attempt });
     const result = await runtime.system.runCommandWithTimeout(argv, {
       timeoutMs: CONFIG_COMMAND_TIMEOUT_MS,
     });
     const { stdout, stderr, exitCode } = extractCommandFailure(result);
     if (stderr.trim()) {
       logWarn("openclaw config command stderr", {
-        argv,
+        ...commandLog,
         attempt,
         stderr: stderr.trim(),
       });
@@ -102,7 +134,7 @@ export async function runCommandArgv(argv: string[]): Promise<void> {
     const retryableConflict = isRetryableConfigConflictMessage(combined);
     if (retryableConflict && attempt < CONFIG_COMMAND_CONFLICT_RETRY_MAX_ATTEMPTS) {
       logWarn("retry openclaw config command after stale config conflict", {
-        argv,
+        ...commandLog,
         attempt,
         maxAttempts: CONFIG_COMMAND_CONFLICT_RETRY_MAX_ATTEMPTS,
       });

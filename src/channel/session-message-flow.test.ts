@@ -61,6 +61,7 @@ function createMessageFlowHarness(options?: {
   const handledSessionMapSettingsSync: Array<Record<string, unknown>> = [];
   const handledProbeRequests: Array<Record<string, unknown>> = [];
   const reportedSessionMapSettings: Array<Record<string, unknown>> = [];
+  const reportedConfigSync: Array<Record<string, unknown>> = [];
   const flow = createClawchatSessionMessageFlow({
     getSelfId: () => "openclaw-user",
     updateSelfIdFromClient: () => undefined,
@@ -89,6 +90,9 @@ function createMessageFlowHarness(options?: {
     sendPresetPromptSyncMarkerToSelf: async () => undefined,
     sendSessionMapSettingsReportToSelf: async (params) => {
       reportedSessionMapSettings.push(params as Record<string, unknown>);
+    },
+    sendConfigSyncReportToSelf: async (params) => {
+      reportedConfigSync.push(params as Record<string, unknown>);
     },
     applyOpenClawConfigBatchSync: async (payload) => {
       handledConfigBatchSync.push(payload as Record<string, unknown>);
@@ -135,6 +139,7 @@ function createMessageFlowHarness(options?: {
     handledSessionMapSettingsSync,
     handledProbeRequests,
     reportedSessionMapSettings,
+    reportedConfigSync,
   };
 }
 
@@ -495,6 +500,7 @@ test("self loopback config batch sync command is consumed before legacy config p
       ext: JSON.stringify({
         openclaw: {
           type: "config_patch",
+          sync_id: "sync-1",
           batchEntries: [
             {
               path: "agents.defaults.model.primary",
@@ -515,6 +521,7 @@ test("self loopback config batch sync command is consumed before legacy config p
   );
 
   assert.equal(harness.handledConfigBatchSync.length, 1);
+  assert.equal(harness.handledConfigBatchSync[0]?.syncId, "sync-1");
   assert.deepEqual(harness.handledConfigBatchSync[0]?.batchEntries, [
     {
       path: "agents.defaults.model.primary",
@@ -526,7 +533,85 @@ test("self loopback config batch sync command is consumed before legacy config p
     },
   ]);
   assert.equal(harness.handledConfigBatchSync[0]?.restartGateway, true);
+  assert.deepEqual(harness.reportedConfigSync, [
+    {
+      syncId: "sync-1",
+      objectType: "config_patch",
+      status: "ok",
+    },
+  ]);
   assert.equal(harness.dispatched.length, 0);
+});
+
+test("self loopback config batch sync reports receipt before apply failure", async () => {
+  const harness = createMessageFlowHarness();
+  harness.flow = createClawchatSessionMessageFlow({
+    getSelfId: () => "openclaw-user",
+    updateSelfIdFromClient: () => undefined,
+    getReadOnlyClient: () => null,
+    loadConfig: async () => ({} as OpenClawConfig),
+    resolveAgentRoute: () => createBaseRoute(),
+    resolveStorePath: () => "/tmp/mock-sessions.json",
+    readSessionUpdatedAt: () => undefined,
+    recordInboundSession: async () => undefined,
+    resolveEnvelopeFormatOptions: () => ({}),
+    formatAgentEnvelope: ({ body }) => body,
+    finalizeInboundContext: (ctx) => ({ ...ctx }),
+    dispatchReplyWithBufferedBlockDispatcher: async () => ({ ok: true }),
+    sendRouterReplyToSelf: async () => undefined,
+    sendPresetPromptSyncMarkerToSelf: async () => undefined,
+    sendSessionMapSettingsReportToSelf: async () => undefined,
+    sendConfigSyncReportToSelf: async (params) => {
+      harness.reportedConfigSync.push(params as Record<string, unknown>);
+    },
+    applyOpenClawConfigBatchSync: async () => {
+      throw new Error("apply failed");
+    },
+    handlePresetPromptSync: async () => undefined,
+    handleSessionMapSettingsSync: async () => undefined,
+    handleProbeRequest: async () => undefined,
+    isSessionMapSyncEnabled: () => true,
+    sendText: async () => "msg-1",
+    sendSessionTranscriptObservedToSelf: async () => undefined,
+    resolveSessionMapping: () => null,
+    applySessionMappingSignal: () => undefined,
+    pendingGroupContext: new Map(),
+    routerGroupQueueByGroupId: new Map(),
+  });
+
+  await harness.flow.onInbound(
+    {
+      id: "config-kv-sync-fail-1",
+      from: "openclaw-user",
+      to: "openclaw-user",
+      type: "command",
+      toType: "roster",
+      content: "",
+      ext: JSON.stringify({
+        openclaw: {
+          type: "config_patch",
+          sync_id: "sync-fail-1",
+          batchEntries: [
+            {
+              path: "agents.defaults.model.primary",
+              value: "lanying/openai/gpt-5-mini",
+            },
+          ],
+        },
+      }),
+      timestamp: 1009,
+    },
+    "direct",
+    createBaseAccount(),
+  );
+
+  assert.deepEqual(harness.reportedConfigSync, [
+    {
+      syncId: "sync-fail-1",
+      objectType: "config_patch",
+      status: "ok",
+    },
+  ]);
 });
 
 test("self-sent direct text delivery is not dispatched back into OpenClaw", async () => {

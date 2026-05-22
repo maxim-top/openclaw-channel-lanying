@@ -68,7 +68,6 @@ export type ProbeCheckStatus = "ok" | "mismatch" | "degraded" | "failed";
 export type ConfigPatchProbeItem = {
   path: string;
   expectedHash: string;
-  expectedSummary?: unknown;
 };
 
 export type ProbeRequestPayload = {

@@ -137,6 +137,13 @@ type MessageFlowContext = {
     sessionMapSync: boolean;
     mergeSubSessions: boolean;
   }) => Promise<void>;
+  sendConfigSyncReportToSelf: (params: {
+    syncId: string;
+    objectType: "config_patch";
+    status: "ok" | "failed";
+    errorCode?: string;
+    errorMessage?: string;
+  }) => Promise<void>;
   applyOpenClawConfigBatchSync: (payload: ConfigBatchSyncPayload) => Promise<void>;
   handlePresetPromptSync: (params: {
     cfg: OpenClawConfig;
@@ -1226,6 +1233,13 @@ export function createClawchatSessionMessageFlow(ctx: MessageFlowContext) {
         }
         if (isSelfLoopback && account.allowManage && configBatchSync) {
           try {
+            if (configBatchSync.syncId) {
+              await ctx.sendConfigSyncReportToSelf({
+                syncId: configBatchSync.syncId,
+                objectType: "config_patch",
+                status: "ok",
+              });
+            }
             await ctx.applyOpenClawConfigBatchSync(configBatchSync);
             logDebug("applied config batch sync from self loopback message", {
               senderId,
