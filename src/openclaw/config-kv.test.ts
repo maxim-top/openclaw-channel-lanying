@@ -98,12 +98,11 @@ test("buildConfigSetBatchEntries rejects empty paths", () => {
   ]), /path is required/);
 });
 
-test("buildGatewayRestartArgv renders a safe gateway restart command", () => {
+test("buildGatewayRestartArgv renders a gateway restart command without safe rpc scope upgrade", () => {
   assert.deepEqual(buildGatewayRestartArgv(), [
     "openclaw",
     "gateway",
     "restart",
-    "--safe",
   ]);
 });
 

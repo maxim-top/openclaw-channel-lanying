@@ -68,7 +68,10 @@ export function buildConfigSetBatchArgv(batchEntries: ConfigBatchEntry[]): strin
 }
 
 export function buildGatewayRestartArgv(): string[] {
-  return ["openclaw", "gateway", "restart", "--safe"];
+  // Avoid the safe-restart RPC path here because it requires operator.admin
+  // scope and can trigger pairing/scope-upgrade prompts during plugin-managed
+  // local config sync.
+  return ["openclaw", "gateway", "restart"];
 }
 
 export function isRetryableConfigConflictMessage(message: string): boolean {
