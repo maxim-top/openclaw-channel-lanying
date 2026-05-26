@@ -10,6 +10,7 @@ import {
   buildGatewayRestartArgv,
   createConfigBatchSyncDigest,
   isRetryableConfigConflictMessage,
+  runCommandArgv,
   summarizeCommandArgvForLog,
 } from "./config-kv.js";
 import { setClawchatRuntime } from "../runtime.js";
@@ -183,6 +184,41 @@ test("applyConfigBatchEntries does not retry non-conflict failures", async () =>
     /validation failed: expected string/,
   );
   assert.equal(attempts, 1);
+});
+
+test("runCommandArgv tolerates empty exit code 1 from gateway restart", async () => {
+  let attempts = 0;
+  setClawchatRuntime({
+    system: {
+      runCommandWithTimeout: async () => {
+        attempts += 1;
+        return {
+          exitCode: 1,
+          stdout: "",
+          stderr: "",
+        };
+      },
+    },
+  });
+
+  await runCommandArgv(buildGatewayRestartArgv());
+  assert.equal(attempts, 1);
+});
+
+test("runCommandArgv still fails gateway restart when stderr is present", async () => {
+  setClawchatRuntime({
+    system: {
+      runCommandWithTimeout: async () => ({
+        exitCode: 1,
+        stderr: "permission denied",
+      }),
+    },
+  });
+
+  await assert.rejects(
+    runCommandArgv(buildGatewayRestartArgv()),
+    /permission denied/,
+  );
 });
 
 test("summarizeCommandArgvForLog redacts batch-json values while preserving paths", () => {

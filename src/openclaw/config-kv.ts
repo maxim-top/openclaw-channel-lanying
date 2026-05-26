@@ -74,6 +74,10 @@ export function buildGatewayRestartArgv(): string[] {
   return ["openclaw", "gateway", "restart"];
 }
 
+function isGatewayRestartArgv(argv: string[]): boolean {
+  return argv.length === 3 && argv[0] === "openclaw" && argv[1] === "gateway" && argv[2] === "restart";
+}
+
 export function isRetryableConfigConflictMessage(message: string): boolean {
   const normalized = message.trim();
   if (!normalized) {
@@ -134,6 +138,14 @@ export async function runCommandArgv(argv: string[]): Promise<void> {
       return;
     }
     const combined = `${stdout}\n${stderr}`.trim();
+    if (isGatewayRestartArgv(argv) && exitCode === 1 && !combined) {
+      logDebug("treat gateway restart exit code as success because supervisor restart likely interrupted the cli", {
+        ...commandLog,
+        attempt,
+        exitCode,
+      });
+      return;
+    }
     const retryableConflict = isRetryableConfigConflictMessage(combined);
     if (retryableConflict && attempt < CONFIG_COMMAND_CONFLICT_RETRY_MAX_ATTEMPTS) {
       logWarn("retry openclaw config command after stale config conflict", {
