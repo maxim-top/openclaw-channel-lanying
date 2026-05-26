@@ -645,6 +645,8 @@ export class ClawchatSession {
   private configPatchQueue: Promise<void> = Promise.resolve();
   private gatewayRestartQueue: Promise<void> = Promise.resolve();
   private recentConfigBatchSyncByDigest = new Map<string, number>();
+  private pendingConfigPatchTasks = 0;
+  private restartNeededAfterConfigPatchDrain = false;
   private pendingConfigRestartTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingConfigRestartPromise: Promise<void> | null = null;
   private pendingConfigRestartResolve: (() => void) | null = null;
@@ -1583,32 +1585,52 @@ export class ClawchatSession {
     syncId?: string;
   }): Promise<void> {
     const digest = createConfigBatchSyncDigest(params.batchEntries);
+    if (this.pendingConfigRestartTimer) {
+      clearTimeout(this.pendingConfigRestartTimer);
+      this.pendingConfigRestartTimer = null;
+      logDebug("cancel pending debounced gateway restart because a new config patch was queued", {
+        digest,
+        batchCount: params.batchEntries.length,
+      });
+    }
+    this.pendingConfigPatchTasks += 1;
     const work = async (): Promise<void> => {
-      const now = Date.now();
-      for (const [key, ts] of this.recentConfigBatchSyncByDigest.entries()) {
-        if (now - ts > CONFIG_PATCH_DEDUPE_TTL_MS) {
-          this.recentConfigBatchSyncByDigest.delete(key);
+      try {
+        const now = Date.now();
+        for (const [key, ts] of this.recentConfigBatchSyncByDigest.entries()) {
+          if (now - ts > CONFIG_PATCH_DEDUPE_TTL_MS) {
+            this.recentConfigBatchSyncByDigest.delete(key);
+          }
         }
-      }
-      if (this.recentConfigBatchSyncByDigest.has(digest)) {
-        logDebug("skip duplicated config batch sync in short window", {
-          digest,
-          batchCount: params.batchEntries.length,
-          restartGateway: params.restartGateway,
-        });
-        return;
-      }
-      await applyConfigBatchEntries(params.batchEntries);
-      if (params.restartGateway) {
-        void this.scheduleDebouncedConfigRestart().catch((err) => {
-          logWarn("background gateway restart after config sync failed", {
-            err,
+        if (this.recentConfigBatchSyncByDigest.has(digest)) {
+          logDebug("skip duplicated config batch sync in short window", {
             digest,
             batchCount: params.batchEntries.length,
+            restartGateway: params.restartGateway,
           });
-        });
+          return;
+        }
+        await applyConfigBatchEntries(params.batchEntries);
+        if (params.restartGateway) {
+          this.restartNeededAfterConfigPatchDrain = true;
+        }
+        this.recentConfigBatchSyncByDigest.set(digest, Date.now());
+      } finally {
+        this.pendingConfigPatchTasks = Math.max(0, this.pendingConfigPatchTasks - 1);
+        if (this.pendingConfigPatchTasks === 0 && this.restartNeededAfterConfigPatchDrain) {
+          this.restartNeededAfterConfigPatchDrain = false;
+          logDebug("config patch queue drained; schedule debounced gateway restart", {
+            digest,
+          });
+          void this.scheduleDebouncedConfigRestart().catch((err) => {
+            logWarn("background gateway restart after config sync failed", {
+              err,
+              digest,
+              batchCount: params.batchEntries.length,
+            });
+          });
+        }
       }
-      this.recentConfigBatchSyncByDigest.set(digest, Date.now());
     };
 
     const queued = this.configPatchQueue.then(work, work);
