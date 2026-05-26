@@ -877,6 +877,12 @@ export class ClawchatSession {
       }
       return parsed;
     } catch (err) {
+      if ((err as NodeJS.ErrnoException | null)?.code === "ENOENT") {
+        logDebug("local session store does not exist yet; treat as empty", {
+          storePath,
+        });
+        return {};
+      }
       logWarn("failed to load local session store", {
         err,
         storePath,
